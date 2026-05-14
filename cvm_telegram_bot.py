@@ -103,11 +103,12 @@ PADROES_TIPO = {
 ALERTAR_EM_ANALISE = True
 
 # Palavras que, no status do pedido, indicam que ele NÃO está mais ativo
-# (foi negado/cancelado/etc.) — esses pedidos não geram nem acompanham alerta.
-# (Ajustável depois de ver os valores reais com --inspect.)
+# (foi negado/cancelado/expirou/etc.) — esses pedidos não geram nem
+# acompanham alerta. Lista calibrada a partir dos valores reais de
+# 'Status_Requerimento' vistos no --inspect.
 STATUS_TERMINAIS = [
     "cancel", "indefer", "desist", "arquivad", "revog",
-    "negad", "extint", "caduc", "interromp",
+    "negad", "extint", "caduc", "interromp", "expir",
 ]
 
 # --- Comportamento ----------------------------------------------------
@@ -216,17 +217,17 @@ COLUMN_CANDIDATES = {
         "valoroferta", "valordistribuicao", "montante",
     ],
     "rito": ["ritorequerimento", "ritooferta", "rito"],
-    "modalidade": ["modalidadeoferta", "modalidaderegistro", "modalidade"],
+    "modalidade": ["modalidadeoferta", "modalidaderegistro", "modalidade",
+                   "tipooferta"],
     "situacao": [
         "statusrequerimento", "situacaooferta", "situacaoregistro",
         "situacao", "status",
     ],
     "lider": ["nomelider", "lider", "coordenadorlider"],
-    # demais coordenadores / consórcio de distribuição
-    "coordenadores": [
-        "grupocoordenador", "demaiscoordenadores", "coordenadores",
-        "consorciodistribuicao", "nomevendedor", "vendedor",
-    ],
+    # categoria/grupo do coordenador líder (ex.: "COORDENADOR PLENO").
+    # OBS.: o conjunto de dados público da CVM NÃO traz a lista completa dos
+    # demais coordenadores/consórcio — só o líder e a categoria dele.
+    "grupo_coordenador": ["grupocoordenador"],
     "publico_alvo": ["publicoalvo", "publico"],
 }
 
@@ -262,11 +263,17 @@ def detect_columns(header: list) -> dict:
 # Casamento de tipo de oferta
 # -------------------------------------------------------------------
 def categorias_da_linha(row: dict, cols: dict) -> list:
-    """Categorias monitoradas que casam com a linha. Lista vazia = não interessa."""
-    textos = []
+    """Categorias monitoradas que casam com a linha. Lista vazia = não interessa.
+
+    Quando a coluna de TIPO foi detectada (caso normal nos dois arquivos da
+    CVM), o casamento usa SÓ ela — assim evita falso positivo, como um
+    "Cotas de FII" cujo emissor se chama "...RECEBÍVEIS IMOBILIÁRIOS...".
+    Só cai na varredura da linha inteira se a coluna de tipo não for achada.
+    """
     if "tipo" in cols:
-        textos.append(normalize(row.get(cols["tipo"], "")))
-    textos.append(normalize(" ".join(str(v) for v in row.values())))
+        textos = [normalize(row.get(cols["tipo"], ""))]
+    else:
+        textos = [normalize(" ".join(str(v) for v in row.values()))]
     encontradas = []
     for categoria, padroes in _PADROES_COMPILADOS.items():
         for txt in textos:
@@ -487,7 +494,7 @@ def formatar_mensagem(row: dict, cols: dict, fase: str) -> str:
     tipo = html_escape(tipo_detectado(row, cols))
     emissor = html_escape(_campo(row, cols, "emissor") or "(não informado)")
     lider = html_escape(_campo(row, cols, "lider"))
-    coords = html_escape(_campo(row, cols, "coordenadores"))
+    grupo_coord = html_escape(_campo(row, cols, "grupo_coordenador"))
     processo = html_escape(_campo(row, cols, "numero"))
     nro_registro = html_escape(_campo(row, cols, "numero_registro"))
     rito = html_escape(_campo(row, cols, "rito"))
@@ -514,8 +521,8 @@ def formatar_mensagem(row: dict, cols: dict, fase: str) -> str:
     ]
     if lider:
         linhas.append(f"🏦 <b>Coordenador líder:</b> {lider}")
-    if coords:
-        linhas.append(f"🤝 <b>Demais coordenadores:</b> {coords}")
+    if grupo_coord:
+        linhas.append(f"🏷️ <b>Categoria do coordenador:</b> {grupo_coord}")
     linhas.append(f"📅 <b>{rotulo_data}:</b> {data_txt}")
     if valor_txt:
         linhas.append(f"💰 <b>Valor:</b> {valor_txt}")
