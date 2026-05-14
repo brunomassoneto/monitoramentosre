@@ -1,0 +1,85 @@
+# Workflow do GitHub Actions: roda o robô CVM automaticamente.
+#
+# Este arquivo PRECISA ficar no caminho:  .github/workflows/cvm-robo.yml
+#
+# O que ele faz:
+#  - dispara o robô de hora em hora (agendamento cron, em UTC);
+#  - também pode ser disparado manualmente pelo botão "Run workflow"
+#    (com opção de só testar o Telegram ou inspecionar os dados);
+#  - usa o cache do Actions para preservar o arquivo estado_ofertas.json
+#    entre uma execução e outra (o repositório fica limpo, sem commits).
+
+name: Robô CVM → Telegram
+
+on:
+  schedule:
+    # 'minuto hora dia mês dia-da-semana' — sempre em UTC.
+    # '0 * * * *' = no minuto 0 de toda hora. Como o robô roda de hora em
+    # hora, o fuso não importa. Para verificar com menos frequência, troque
+    # por algo como '0 */3 * * *' (a cada 3 horas).
+    - cron: '0 * * * *'
+
+  # Permite rodar na mão pela aba "Actions" do GitHub (útil para testar).
+  workflow_dispatch:
+    inputs:
+      modo:
+        description: 'O que executar'
+        type: choice
+        default: verificar
+        options:
+          - verificar          # verificação normal (envia alertas de ofertas novas)
+          - testar-telegram    # só envia uma mensagem de teste
+          - inspecionar        # só baixa os dados e mostra as colunas do CSV
+
+# Evita que duas execuções rodem ao mesmo tempo (e disputem o cache).
+concurrency:
+  group: cvm-robo
+  cancel-in-progress: false
+
+jobs:
+  verificar-ofertas:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baixar o código do repositório
+        uses: actions/checkout@v4
+
+      - name: Instalar o Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Instalar dependências
+        run: pip install -r requirements.txt
+
+      # Restaura o estado_ofertas.json da execução anterior.
+      # A 'key' é única por execução (github.run_id), então toda run é um
+      # "cache miss" no key exato -> o Actions restaura pelo 'restore-keys'
+      # (a versão mais recente) e, no fim do job, salva um cache novo com o
+      # estado atualizado. É o padrão recomendado para "cache que muda".
+      - name: Restaurar o estado da última execução
+        uses: actions/cache@v4
+        with:
+          path: estado_ofertas.json
+          key: cvm-estado-${{ github.run_id }}
+          restore-keys: |
+            cvm-estado-
+
+      - name: Rodar o robô
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Em execução agendada não há "input"; o padrão vira 'verificar'.
+          MODO: ${{ github.event.inputs.modo || 'verificar' }}
+        run: |
+          echo "Modo: $MODO"
+          case "$MODO" in
+            testar-telegram)
+              python cvm_telegram_bot.py --test-telegram
+              ;;
+            inspecionar)
+              python cvm_telegram_bot.py --inspect
+              ;;
+            *)
+              python cvm_telegram_bot.py
+              ;;
+          esac
