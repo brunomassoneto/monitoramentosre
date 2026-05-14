@@ -4,9 +4,14 @@
 Robô CVM → Telegram
 ===================
 
-Monitora o registro de novas ofertas públicas de distribuição na CVM e envia
-um alerta no Telegram sempre que aparece uma nova oferta dos tipos:
+Monitora ofertas públicas de distribuição na CVM e avisa no Telegram quando:
+  - um NOVO PEDIDO de oferta entra em análise; e
+  - uma oferta é REGISTRADA (ou tem o registro dispensado).
 
+Ou seja, a mesma oferta pode gerar dois alertas ao longo do seu ciclo:
+"📥 em análise"  ->  "✅ registrada".
+
+Tipos monitorados:
     - CRA  (Certificado de Recebíveis do Agronegócio)
     - CRI  (Certificado de Recebíveis Imobiliários)
     - Debêntures
@@ -18,27 +23,27 @@ Portal de Dados Abertos da CVM (mantido pela própria SRE):
 
     https://dados.cvm.gov.br/dados/OFERTA/DISTRIB/DADOS/oferta_distribuicao.zip
 
-O arquivo contém as ofertas registradas/dispensadas (ICVM 400, RCVM 160 rito
-ordinário, ICVM 555 e RCVM 160 rito automático). É atualizado pela CVM
-diariamente (às vezes mais de uma vez por dia). É a fonte pública, estável e
-oficial equivalente ao que aparece na tela de "Consulta de Oferta Pública" do
-sistema SRE.
+O .zip contém dois arquivos, e o robô lê os dois:
+  - oferta_distribuicao.csv  -> ofertas ICVM 400, RCVM 160 rito ordinário,
+                                ICVM 555 e ICVM 476 encerradas (histórico longo).
+  - oferta_resolucao_160.csv -> ofertas em rito automático (Resolução CVM 160);
+                                este arquivo traz também os pedidos AINDA EM
+                                ANÁLISE (coluna de status), por isso é a
+                                principal fonte dos alertas "em análise".
 
-Observação sobre tempo real: o sistema web do SRE
-(web.cvm.gov.br/sre-publico-cvm) mostra os dados em tempo quase real, mas usa
-uma API interna não documentada. Este robô usa o Dados Abertos por ser uma
-fonte oficial e estável — o custo é uma latência de algumas horas até ~1 dia.
-Para a maioria dos usos (acompanhar o pipeline de ofertas) isso é suficiente.
+É atualizado pela CVM diariamente (às vezes mais de uma vez por dia). É a fonte
+pública, oficial e estável equivalente à tela de "Consulta de Oferta Pública"
+do sistema SRE. O custo é uma latência de algumas horas até ~1 dia.
 
 Como usar
 ---------
-    python cvm_telegram_bot.py --inspect        # baixa e mostra as colunas reais do CSV
+    python cvm_telegram_bot.py --inspect        # baixa e analisa a estrutura do CSV
     python cvm_telegram_bot.py --test-telegram  # envia uma mensagem de teste
-    python cvm_telegram_bot.py                  # uma verificação (ideal para cron)
+    python cvm_telegram_bot.py                  # uma verificação (ideal para cron/Actions)
     python cvm_telegram_bot.py --loop           # roda continuamente
     python cvm_telegram_bot.py --dry-run        # verifica mas imprime em vez de enviar
 
-Veja o README.md para a configuração do bot do Telegram e do agendamento.
+Veja o README.md / RODAR_NO_GITHUB_ACTIONS.md para a configuração.
 """
 
 import argparse
@@ -53,6 +58,7 @@ import sys
 import time
 import unicodedata
 import zipfile
+from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -65,46 +71,60 @@ except ImportError:
 # ===================================================================
 # CONFIGURAÇÃO
 # ===================================================================
-# Você pode definir tudo por variável de ambiente (recomendado) OU
-# editar os valores padrão abaixo diretamente.
 
 # --- Telegram ---------------------------------------------------------
-# Token do bot (criado com o @BotFather) e o ID do chat de destino.
+# No GitHub Actions estes valores vêm dos "Secrets" — NÃO escreva o token
+# aqui se o código for para um repositório.
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "COLE_AQUI_O_TOKEN_DO_BOT")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "COLE_AQUI_O_CHAT_ID")
 
 # --- O que monitorar --------------------------------------------------
-# Tipos de valor mobiliário de interesse. O casamento é feito sem acento
-# e sem diferenciar maiúsculas/minúsculas. NÃO precisa mexer aqui a menos
-# que queira incluir/excluir tipos.
-#
-# Acrônimos curtos (casam como palavra inteira):
-KEYWORDS_PALAVRA = ["cra", "cri"]
-# Termos longos (casam como trecho do texto — cobrem plural e variações):
-KEYWORDS_TRECHO = [
-    "certificado de recebiveis do agronegocio",
-    "certificado de recebiveis imobiliario",   # cobre "imobiliário" e "imobiliários"
-    "debenture",                               # cobre "debênture" e "debêntures"
-    "nota comercial",
-    "nota promissoria",                        # cobre "nota promissória comercial"
+# Padrões (regex) que casam SEM acento e SEM diferenciar maiúsculas. Foram
+# feitos para casar singular E plural ("debênture"/"debêntures",
+# "nota comercial"/"notas comerciais"). Para monitorar só um tipo, deixe
+# apenas a entrada desejada.
+PADROES_TIPO = {
+    "CRA — Certificado de Recebíveis do Agronegócio": [
+        r"\bcra\b", r"recebiveis\s+do\s+agronegocio",
+    ],
+    "CRI — Certificado de Recebíveis Imobiliários": [
+        r"\bcri\b", r"recebiveis\s+imobiliari",
+    ],
+    "Debêntures": [
+        r"\bdebentur",
+    ],
+    "Notas Comerciais": [
+        r"\bnotas?\s+comerci", r"\bnota\s+promissoria",
+    ],
+}
+
+# Avisar também quando um pedido ENTRA EM ANÁLISE (além do alerta de
+# registro)? True = dois alertas por oferta ao longo do ciclo.
+ALERTAR_EM_ANALISE = True
+
+# Palavras que, no status do pedido, indicam que ele NÃO está mais ativo
+# (foi negado/cancelado/etc.) — esses pedidos não geram nem acompanham alerta.
+# (Ajustável depois de ver os valores reais com --inspect.)
+STATUS_TERMINAIS = [
+    "cancel", "indefer", "desist", "arquivad", "revog",
+    "negad", "extint", "caduc", "interromp",
 ]
 
 # --- Comportamento ----------------------------------------------------
-# Intervalo entre verificações (segundos) no modo --loop. 3600 = 1 hora.
 POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "3600"))
 
-# Só considera "nova" uma oferta cuja data de registro esteja dentro desta
-# janela. Evita re-notificar histórico antigo e mantém a comparação enxuta.
+# Só considera "nova" uma oferta cuja data de referência (registro, dispensa
+# ou entrada do pedido) esteja dentro desta janela. Evita re-notificar
+# histórico antigo (o arquivo da CVM tem ofertas desde 1990).
 JANELA_DIAS = int(os.environ.get("JANELA_DIAS", "45"))
 
 # --- Fonte de dados / arquivos locais ---------------------------------
 CVM_ZIP_URL = "https://dados.cvm.gov.br/dados/OFERTA/DISTRIB/DADOS/oferta_distribuicao.zip"
 
 BASE_DIR = Path(__file__).resolve().parent
-STATE_FILE = BASE_DIR / "estado_ofertas.json"   # ofertas já notificadas
+STATE_FILE = BASE_DIR / "estado_ofertas.json"
 LOG_FILE = BASE_DIR / "cvm_robo.log"
 
-# Link mostrado nas mensagens (tela pública de consulta do SRE).
 LINK_CONSULTA = "https://web.cvm.gov.br/sre-publico-cvm/#/consulta-oferta-publica"
 
 # ===================================================================
@@ -121,90 +141,111 @@ logging.basicConfig(
 )
 log = logging.getLogger("cvm-robo")
 
+_PADROES_COMPILADOS = {
+    categoria: [re.compile(p) for p in padroes]
+    for categoria, padroes in PADROES_TIPO.items()
+}
+
+FASE_ANALISE = "analise"
+FASE_REGISTRADA = "registrada"
+
 
 # -------------------------------------------------------------------
 # Utilitários de texto
 # -------------------------------------------------------------------
 def strip_accents(texto: str) -> str:
-    """Remove acentos: 'Debênture' -> 'Debenture'."""
     nfkd = unicodedata.normalize("NFKD", texto)
     return "".join(c for c in nfkd if not unicodedata.combining(c))
 
 
 def normalize(texto: str) -> str:
-    """Normaliza para comparação: sem acento, minúsculo, espaços colapsados."""
     if texto is None:
         return ""
     t = strip_accents(str(texto)).lower()
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
+    return re.sub(r"\s+", " ", t).strip()
 
 
 def norm_header(nome: str) -> str:
-    """Normaliza nome de coluna: 'Data_Registro' / 'Data Registro' -> 'dataregistro'."""
     return re.sub(r"[^a-z0-9]", "", strip_accents(str(nome)).lower())
 
 
 def html_escape(texto: str) -> str:
-    """Escapa caracteres especiais para o parse_mode=HTML do Telegram."""
-    return (
-        str(texto)
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
+    return (str(texto).replace("&", "&amp;")
+            .replace("<", "&lt;").replace(">", "&gt;"))
 
 
 # -------------------------------------------------------------------
 # Detecção de colunas
 # -------------------------------------------------------------------
-# O layout exato do CSV da CVM pode variar com o tempo (a CVM já mudou
-# nomes de colunas mais de uma vez). Por isso o robô NÃO usa nomes fixos:
-# ele procura, no cabeçalho real, a coluna mais provável para cada campo.
+# O layout do CSV da CVM pode variar com o tempo e os DOIS arquivos do zip
+# têm layouts diferentes. O robô procura, no cabeçalho real de cada arquivo,
+# a coluna mais provável para cada campo lógico.
 COLUMN_CANDIDATES = {
     "tipo": [
-        "valormobiliario", "tipovalormobiliario", "especievalormobiliario",
-        "especie", "tipoativo", "tipooferta", "valoresmobiliarios",
+        "tipoativo", "valormobiliario", "tipovalormobiliario",
+        "especievalormobiliario", "especieativo", "especie",
+        "valoresmobiliarios", "tipooferta",
     ],
     "emissor": [
         "nomeemissor", "emissor", "nomedoemissor", "denominacaoemissor",
-        "razaosocialemissor", "nomeofertante", "ofertante", "denominacaosocial",
+        "razaosocialemissor", "nomeofertante", "ofertante",
     ],
+    # identificador único (dedup): o número de processo é o mais estável
     "numero": [
-        "numeroregistro", "numregistro", "numerodoregistro", "numeroprocesso",
-        "numerooferta", "numerorequerimento", "protocolo", "numprocesso",
-        "idoferta", "numero",
+        "numeroprocesso", "numprocesso", "processosei", "processo",
+        "numeroregistrooferta", "numeroregistro", "numerorequerimento",
+        "protocolo", "numero",
+    ],
+    "numero_registro": [
+        "numeroregistrooferta", "numeroregistro", "numerorequerimento",
     ],
     "data_registro": [
-        "dataregistro", "datadoregistro", "dataconcessaoregistro",
-        "dataconcessao", "datadeconcessao", "datadeferimento",
+        "dataregistrooferta", "dataregistro", "datadoregistro",
+        "dataconcessaoregistro", "dataconcessao", "datadeconcessao",
     ],
-    "data_inicio": ["datainiciooferta", "datainicio", "datadainiciooferta"],
+    "data_dispensa": [
+        "datadispensaoferta", "datadispensa", "datadispensaregistro",
+    ],
+    # data em que o pedido entrou na CVM (usada para a fase "em análise")
+    "data_entrada": [
+        "datarequerimento", "dataprotocolo", "dataaberturaprocesso",
+        "dataabertura",
+    ],
     "valor": [
-        "valoroferta", "valortotaloferta", "valortotal", "montante",
-        "valordistribuicao", "valortotaldistribuicao", "valormobiliariooferta",
+        "valortotalregistrado", "valortotaloferta", "valortotal",
+        "valoroferta", "valordistribuicao", "montante",
     ],
+    "rito": ["ritorequerimento", "ritooferta", "rito"],
     "modalidade": ["modalidadeoferta", "modalidaderegistro", "modalidade"],
-    "situacao": ["situacao", "status", "situacaooferta", "situacaoregistro"],
+    "situacao": [
+        "statusrequerimento", "situacaooferta", "situacaoregistro",
+        "situacao", "status",
+    ],
+    "lider": ["nomelider", "lider", "coordenadorlider"],
+    # demais coordenadores / consórcio de distribuição
+    "coordenadores": [
+        "grupocoordenador", "demaiscoordenadores", "coordenadores",
+        "consorciodistribuicao", "nomevendedor", "vendedor",
+    ],
+    "publico_alvo": ["publicoalvo", "publico"],
 }
 
+# Para o --inspect: descobre colunas relacionadas a coordenadores.
+PALAVRAS_COORDENADOR = ["coordenador", "lider", "vendedor", "consorcio",
+                        "distribuidor", "intermediar", "underwriter"]
 
-def detect_columns(header: list[str]) -> dict[str, str]:
-    """
-    Recebe o cabeçalho real do CSV e devolve um mapa
-    {campo_logico: nome_real_da_coluna} com a melhor correspondência.
-    """
+
+def detect_columns(header: list) -> dict:
+    """Mapa {campo_logico: nome_real_da_coluna} com a melhor correspondência."""
     norm_map = {norm_header(h): h for h in header}
-    resultado: dict[str, str] = {}
+    resultado = {}
     for campo, candidatos in COLUMN_CANDIDATES.items():
         achou = None
-        # 1) match exato
-        for cand in candidatos:
+        for cand in candidatos:                       # 1) match exato
             if cand in norm_map:
                 achou = norm_map[cand]
                 break
-        # 2) match por "contém"
-        if achou is None:
+        if achou is None:                             # 2) match por "contém"
             for cand in candidatos:
                 for nh, original in norm_map.items():
                     if cand in nh:
@@ -220,80 +261,57 @@ def detect_columns(header: list[str]) -> dict[str, str]:
 # -------------------------------------------------------------------
 # Casamento de tipo de oferta
 # -------------------------------------------------------------------
-def linha_interessa(row: dict, cols: dict) -> bool:
-    """
-    Decide se a linha é de um tipo monitorado.
-
-    Estratégia robusta: se o robô identificou a coluna de 'tipo', usa ela;
-    senão (ou além disso) varre o conteúdo inteiro da linha. Como os termos
-    procurados são bem específicos, o risco de falso positivo é mínimo.
-    """
-    # Texto da coluna de tipo, se identificada
-    alvos = []
+def categorias_da_linha(row: dict, cols: dict) -> list:
+    """Categorias monitoradas que casam com a linha. Lista vazia = não interessa."""
+    textos = []
     if "tipo" in cols:
-        alvos.append(row.get(cols["tipo"], ""))
-    # Fallback: a linha inteira concatenada
-    alvos.append(" ".join(str(v) for v in row.values()))
+        textos.append(normalize(row.get(cols["tipo"], "")))
+    textos.append(normalize(" ".join(str(v) for v in row.values())))
+    encontradas = []
+    for categoria, padroes in _PADROES_COMPILADOS.items():
+        for txt in textos:
+            if txt and any(p.search(txt) for p in padroes):
+                encontradas.append(categoria)
+                break
+    return encontradas
 
-    for alvo in alvos:
-        txt = normalize(alvo)
-        if not txt:
-            continue
-        # acrônimos curtos: palavra inteira
-        for kw in KEYWORDS_PALAVRA:
-            if re.search(r"\b" + re.escape(kw) + r"\b", txt):
-                return True
-        # termos longos: trecho
-        for kw in KEYWORDS_TRECHO:
-            if kw in txt:
-                return True
-    return False
+
+def linha_interessa(row: dict, cols: dict) -> bool:
+    return bool(categorias_da_linha(row, cols))
 
 
 def tipo_detectado(row: dict, cols: dict) -> str:
-    """Devolve uma etiqueta amigável do tipo, para exibir na mensagem."""
     if "tipo" in cols and row.get(cols["tipo"]):
         return str(row[cols["tipo"]]).strip()
-    # tenta inferir pelo conteúdo
-    txt = normalize(" ".join(str(v) for v in row.values()))
-    if "agronegocio" in txt or re.search(r"\bcra\b", txt):
-        return "CRA (Certificado de Recebíveis do Agronegócio)"
-    if "imobiliario" in txt or re.search(r"\bcri\b", txt):
-        return "CRI (Certificado de Recebíveis Imobiliários)"
-    if "debenture" in txt:
-        return "Debênture"
-    if "nota comercial" in txt or "nota promissoria" in txt:
-        return "Nota Comercial"
-    return "(tipo não identificado)"
+    cats = categorias_da_linha(row, cols)
+    return " / ".join(cats) if cats else "(tipo não identificado)"
 
 
 # -------------------------------------------------------------------
-# Identificador único da oferta (para deduplicação)
+# Identificador único da oferta
 # -------------------------------------------------------------------
-def offer_id(filename: str, row: dict, cols: dict) -> str:
+def offer_id(row: dict, cols: dict) -> str:
     """
-    Gera um ID estável para a oferta. Preferência pelo número de
-    registro/processo; se não houver, usa um hash do conteúdo da linha.
+    ID estável da oferta. Usa o número de processo (estável e comum aos dois
+    arquivos -> a mesma oferta não é notificada duas vezes pela mesma fase).
+    O ID NÃO inclui o nome do arquivo de propósito.
     """
     if "numero" in cols and row.get(cols["numero"]):
-        return f"{filename}:{str(row[cols['numero']]).strip()}"
-    # fallback: hash do conteúdo
+        return f"proc:{str(row[cols['numero']]).strip()}"
     bruto = "|".join(f"{k}={v}" for k, v in sorted(row.items()))
     h = hashlib.sha1(bruto.encode("utf-8", errors="replace")).hexdigest()[:16]
-    return f"{filename}:hash:{h}"
+    return f"hash:{h}"
 
 
 # -------------------------------------------------------------------
 # Datas
 # -------------------------------------------------------------------
 def parse_data(valor: str):
-    """Tenta interpretar uma data em vários formatos comuns da CVM."""
     if not valor:
         return None
     s = str(valor).strip()
     if not s or s.lower() in ("nan", "none", "null"):
         return None
-    # ISO costuma vir como 'YYYY-MM-DD' (possivelmente com horário)
     s_data = s.split(" ")[0].split("T")[0]
     for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d", "%d-%m-%Y"):
         try:
@@ -303,9 +321,9 @@ def parse_data(valor: str):
     return None
 
 
-def data_da_oferta(row: dict, cols: dict):
-    """Pega a melhor data disponível: registro > início da oferta."""
-    for campo in ("data_registro", "data_inicio"):
+def data_de_registro(row: dict, cols: dict):
+    """Data de registro (ou de dispensa de registro). None se não houver."""
+    for campo in ("data_registro", "data_dispensa"):
         if campo in cols:
             d = parse_data(row.get(cols[campo], ""))
             if d:
@@ -313,11 +331,55 @@ def data_da_oferta(row: dict, cols: dict):
     return None
 
 
+def data_de_entrada(row: dict, cols: dict):
+    """Data em que o pedido entrou na CVM. None se não houver."""
+    if "data_entrada" in cols:
+        return parse_data(row.get(cols["data_entrada"], ""))
+    return None
+
+
+# -------------------------------------------------------------------
+# Fase da oferta (em análise / registrada / ignorar)
+# -------------------------------------------------------------------
+def status_e_terminal(row: dict, cols: dict) -> bool:
+    """True se o status indica pedido encerrado sem registro (negado/cancelado…)."""
+    st = normalize(_campo(row, cols, "situacao"))
+    return any(palavra in st for palavra in STATUS_TERMINAIS)
+
+
+def fase_da_oferta(row: dict, cols: dict):
+    """
+    Devolve a fase atual da oferta:
+      - FASE_REGISTRADA : tem data de registro/dispensa
+      - FASE_ANALISE    : pedido ativo, ainda sem registro
+      - None            : ignorar (pedido encerrado sem registro, ou
+                          linha sem informação suficiente)
+    """
+    if data_de_registro(row, cols) is not None:
+        return FASE_REGISTRADA
+    if not ALERTAR_EM_ANALISE:
+        return None
+    if status_e_terminal(row, cols):
+        return None
+    # sem registro e não-terminal: considera "em análise" se há algum sinal
+    # de pedido ativo (um status preenchido ou uma data de entrada).
+    tem_status = bool(_campo(row, cols, "situacao"))
+    if tem_status or data_de_entrada(row, cols) is not None:
+        return FASE_ANALISE
+    return None
+
+
+def data_de_referencia(row: dict, cols: dict, fase: str):
+    """Data usada para o filtro de janela, conforme a fase."""
+    if fase == FASE_REGISTRADA:
+        return data_de_registro(row, cols)
+    return data_de_entrada(row, cols)
+
+
 # -------------------------------------------------------------------
 # Download e leitura do ZIP da CVM
 # -------------------------------------------------------------------
 def baixar_zip(url: str) -> bytes:
-    """Baixa o arquivo .zip da CVM. Lança exceção em caso de falha."""
     log.info("Baixando dados da CVM: %s", url)
     resp = requests.get(url, timeout=120, headers={"User-Agent": "cvm-robo/1.0"})
     resp.raise_for_status()
@@ -326,11 +388,7 @@ def baixar_zip(url: str) -> bytes:
 
 
 def ler_csvs_do_zip(zip_bytes: bytes):
-    """
-    Gera tuplas (nome_arquivo, header, lista_de_linhas) para cada .csv
-    dentro do zip. Os arquivos da CVM são separados por ';' e codificados
-    em ISO-8859-1 (latin-1).
-    """
+    """Gera (nome_arquivo, header, linhas) para cada .csv do zip (sep ';', latin-1)."""
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
         nomes_csv = [n for n in zf.namelist() if n.lower().endswith(".csv")]
         if not nomes_csv:
@@ -348,18 +406,22 @@ def ler_csvs_do_zip(zip_bytes: bytes):
 
 
 # -------------------------------------------------------------------
-# Estado (ofertas já notificadas)
+# Estado (fase já notificada de cada oferta)
 # -------------------------------------------------------------------
 def carregar_estado() -> dict:
     if STATE_FILE.exists():
         try:
             with open(STATE_FILE, "r", encoding="utf-8") as fh:
                 dados = json.load(fh)
-            dados.setdefault("ids_notificados", [])
+            # migração do formato antigo {"ids_notificados": [...]}
+            if "ofertas" not in dados:
+                antigos = dados.get("ids_notificados", [])
+                dados["ofertas"] = {oid: FASE_REGISTRADA for oid in antigos}
+            dados.setdefault("ofertas", {})
             return dados
         except Exception as exc:  # noqa: BLE001
             log.error("Estado corrompido (%s). Começando do zero.", exc)
-    return {"ids_notificados": [], "primeira_execucao": True}
+    return {"ofertas": {}, "primeira_execucao": True}
 
 
 def salvar_estado(estado: dict) -> None:
@@ -367,14 +429,13 @@ def salvar_estado(estado: dict) -> None:
     tmp = STATE_FILE.with_suffix(".tmp")
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(estado, fh, ensure_ascii=False, indent=2)
-    tmp.replace(STATE_FILE)  # gravação atômica
+    tmp.replace(STATE_FILE)
 
 
 # -------------------------------------------------------------------
-# Telegram
+# Telegram / formatação
 # -------------------------------------------------------------------
 def enviar_telegram(texto: str) -> bool:
-    """Envia uma mensagem. Retorna True se enviou com sucesso."""
     if (not TELEGRAM_BOT_TOKEN or "COLE_AQUI" in TELEGRAM_BOT_TOKEN
             or not TELEGRAM_CHAT_ID or "COLE_AQUI" in TELEGRAM_CHAT_ID):
         log.error("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID não configurados.")
@@ -397,69 +458,131 @@ def enviar_telegram(texto: str) -> bool:
         return False
 
 
-def formatar_mensagem(nome_arquivo: str, row: dict, cols: dict) -> str:
-    """Monta o texto (HTML) do alerta de uma oferta."""
-    tipo = html_escape(tipo_detectado(row, cols))
-    emissor = html_escape(row.get(cols.get("emissor", ""), "") or "(não informado)")
-    numero = html_escape(row.get(cols.get("numero", ""), "") or "—")
-    modalidade = html_escape(row.get(cols.get("modalidade", ""), "") or "—")
-    situacao = html_escape(row.get(cols.get("situacao", ""), "") or "")
-
-    d = data_da_oferta(row, cols)
-    data_txt = d.strftime("%d/%m/%Y") if d else "—"
-
-    valor_bruto = row.get(cols.get("valor", ""), "") or ""
-    valor_txt = formatar_valor(valor_bruto)
-
-    linhas = [
-        "🆕 <b>Nova oferta registrada na CVM</b>",
-        "",
-        f"📄 <b>Tipo:</b> {tipo}",
-        f"🏢 <b>Emissor:</b> {emissor}",
-        f"🔢 <b>Registro/Processo:</b> {numero}",
-        f"📅 <b>Data:</b> {data_txt}",
-    ]
-    if valor_txt:
-        linhas.append(f"💰 <b>Valor:</b> {valor_txt}")
-    if modalidade and modalidade != "—":
-        linhas.append(f"📋 <b>Modalidade:</b> {modalidade}")
-    if situacao:
-        linhas.append(f"📌 <b>Situação:</b> {situacao}")
-    linhas += [
-        "",
-        f"📁 <i>{html_escape(nome_arquivo)}</i>",
-        f'🔗 <a href="{LINK_CONSULTA}">Consultar no sistema SRE</a>',
-    ]
-    return "\n".join(linhas)
+def _campo(row: dict, cols: dict, chave: str) -> str:
+    if chave not in cols:
+        return ""
+    return str(row.get(cols[chave], "") or "").strip()
 
 
 def formatar_valor(bruto: str) -> str:
-    """Tenta exibir o valor como moeda; se não der, devolve o texto cru."""
     s = str(bruto).strip()
-    if not s or s.lower() in ("nan", "none", "null", "0"):
+    if not s or s.lower() in ("nan", "none", "null", "0", "0.0", "0,0"):
         return ""
-    limpo = s.replace("R$", "").strip()
-    # normaliza separadores: remove milhar, troca decimal por ponto
-    teste = limpo
+    teste = s.replace("R$", "").strip()
     if "," in teste and "." in teste:
         teste = teste.replace(".", "").replace(",", ".")
     elif "," in teste:
         teste = teste.replace(",", ".")
     try:
         n = float(teste)
+        if n <= 0:
+            return ""
         return "R$ " + f"{n:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
     except ValueError:
-        return s  # devolve cru se não for número reconhecível
+        return s
+
+
+def formatar_mensagem(row: dict, cols: dict, fase: str) -> str:
+    """Monta o texto (HTML) do alerta, conforme a fase da oferta."""
+    tipo = html_escape(tipo_detectado(row, cols))
+    emissor = html_escape(_campo(row, cols, "emissor") or "(não informado)")
+    lider = html_escape(_campo(row, cols, "lider"))
+    coords = html_escape(_campo(row, cols, "coordenadores"))
+    processo = html_escape(_campo(row, cols, "numero"))
+    nro_registro = html_escape(_campo(row, cols, "numero_registro"))
+    rito = html_escape(_campo(row, cols, "rito"))
+    modalidade = html_escape(_campo(row, cols, "modalidade"))
+    situacao = html_escape(_campo(row, cols, "situacao"))
+    publico = html_escape(_campo(row, cols, "publico_alvo"))
+    valor_txt = formatar_valor(_campo(row, cols, "valor"))
+
+    if fase == FASE_REGISTRADA:
+        cabecalho = "✅ <b>Oferta registrada na CVM</b>"
+        d = data_de_referencia(row, cols, fase)
+        rotulo_data = "Data de registro"
+    else:
+        cabecalho = "📥 <b>Novo pedido de oferta em análise na CVM</b>"
+        d = data_de_referencia(row, cols, fase)
+        rotulo_data = "Data de entrada"
+    data_txt = d.strftime("%d/%m/%Y") if d else "—"
+
+    linhas = [
+        cabecalho,
+        "",
+        f"📄 <b>Tipo:</b> {tipo}",
+        f"🏢 <b>Emissor:</b> {emissor}",
+    ]
+    if lider:
+        linhas.append(f"🏦 <b>Coordenador líder:</b> {lider}")
+    if coords:
+        linhas.append(f"🤝 <b>Demais coordenadores:</b> {coords}")
+    linhas.append(f"📅 <b>{rotulo_data}:</b> {data_txt}")
+    if valor_txt:
+        linhas.append(f"💰 <b>Valor:</b> {valor_txt}")
+    if rito:
+        linhas.append(f"📊 <b>Rito:</b> {rito}")
+    if modalidade:
+        linhas.append(f"📋 <b>Modalidade:</b> {modalidade}")
+    if publico:
+        linhas.append(f"👥 <b>Público-alvo:</b> {publico}")
+    if situacao:
+        linhas.append(f"📌 <b>Situação:</b> {situacao}")
+    if nro_registro:
+        linhas.append(f"🔢 <b>Nº registro/requerimento:</b> {nro_registro}")
+    if processo:
+        linhas.append(f"🗂️ <b>Processo:</b> {processo}")
+    linhas += ["", f'🔗 <a href="{LINK_CONSULTA}">Consultar no sistema SRE</a>']
+    return "\n".join(linhas)
 
 
 # -------------------------------------------------------------------
 # Núcleo: uma verificação
 # -------------------------------------------------------------------
+def coletar_candidatas(zip_bytes: bytes):
+    """
+    Lê os CSVs e devolve um dict {offer_id: (row, cols, fase)} com as ofertas
+    de interesse, na janela, deduplicadas (mesma oferta = 1 entrada; se houver
+    linhas em fases diferentes, prevalece 'registrada').
+    """
+    limite_data = datetime.now() - timedelta(days=JANELA_DIAS)
+    melhor = {}
+    total_linhas = 0
+
+    for nome_arquivo, header, linhas in ler_csvs_do_zip(zip_bytes):
+        cols = detect_columns(header)
+        chaves = {k: cols[k] for k in ("tipo", "numero", "data_registro",
+                                       "data_entrada", "situacao") if k in cols}
+        log.info("Arquivo '%s': %d linhas. Colunas-chave: %s",
+                 nome_arquivo, len(linhas), chaves)
+        total_linhas += len(linhas)
+        for row in linhas:
+            if not linha_interessa(row, cols):
+                continue
+            fase = fase_da_oferta(row, cols)
+            if fase is None:
+                continue
+            dref = data_de_referencia(row, cols, fase)
+            if dref is not None:
+                if dref < limite_data:
+                    continue
+            else:
+                # registrada sempre tem data; só 'analise' pode cair aqui.
+                # se o arquivo TEM coluna de entrada mas veio vazia, ignora.
+                if "data_entrada" in cols:
+                    continue
+            oid = offer_id(row, cols)
+            atual = melhor.get(oid)
+            if atual is None:
+                melhor[oid] = (row, cols, fase)
+            elif atual[2] == FASE_ANALISE and fase == FASE_REGISTRADA:
+                melhor[oid] = (row, cols, fase)   # registrada prevalece
+    return melhor, total_linhas
+
+
 def verificar(dry_run: bool = False, notificar_primeira: bool = False) -> None:
-    """Executa uma verificação completa: baixa, filtra, notifica, salva estado."""
     estado = carregar_estado()
     primeira = estado.get("primeira_execucao", False) or not STATE_FILE.exists()
-    ja_notificados = set(estado.get("ids_notificados", []))
+    ofertas_estado = dict(estado.get("ofertas", {}))   # oid -> fase já notificada
 
     try:
         zip_bytes = baixar_zip(CVM_ZIP_URL)
@@ -467,121 +590,176 @@ def verificar(dry_run: bool = False, notificar_primeira: bool = False) -> None:
         log.error("Não foi possível baixar os dados da CVM: %s", exc)
         return
 
-    limite_data = datetime.now() - timedelta(days=JANELA_DIAS)
-    candidatas = []   # (nome_arquivo, row, cols, id)
-    total_linhas = 0
+    candidatas, total_linhas = coletar_candidatas(zip_bytes)
+    n_analise = sum(1 for _, _, f in candidatas.values() if f == FASE_ANALISE)
+    n_reg = sum(1 for _, _, f in candidatas.values() if f == FASE_REGISTRADA)
+    log.info("Linhas lidas: %d | ofertas de interesse na janela: %d "
+             "(%d em análise, %d registradas)",
+             total_linhas, len(candidatas), n_analise, n_reg)
 
-    for nome_arquivo, header, linhas in ler_csvs_do_zip(zip_bytes):
-        cols = detect_columns(header)
-        log.info("Arquivo '%s': %d linhas. Colunas detectadas: %s",
-                 nome_arquivo, len(linhas), cols or "(nenhuma)")
-        total_linhas += len(linhas)
-        for row in linhas:
-            if not linha_interessa(row, cols):
-                continue
-            # filtro de janela temporal (se houver data utilizável)
-            d = data_da_oferta(row, cols)
-            if d is not None and d < limite_data:
-                continue
-            oid = offer_id(nome_arquivo, row, cols)
-            candidatas.append((nome_arquivo, row, cols, oid))
-
-    log.info("Total de linhas lidas: %d | ofertas de interesse na janela: %d",
-             total_linhas, len(candidatas))
-
-    # Primeira execução: apenas semeia o estado, sem disparar notificações
-    # (a menos que o usuário peça explicitamente).
+    # Primeira execução: apenas semeia o estado, sem disparar notificações.
     if primeira and not notificar_primeira:
-        for _, _, _, oid in candidatas:
-            ja_notificados.add(oid)
-        estado["ids_notificados"] = sorted(ja_notificados)
+        for oid, (_, _, fase) in candidatas.items():
+            ofertas_estado[oid] = fase
+        estado["ofertas"] = ofertas_estado
         estado["primeira_execucao"] = False
         if not dry_run:
             salvar_estado(estado)
         log.info("Primeira execução: %d ofertas registradas no estado SEM "
-                 "notificar. A partir de agora só as novas geram alerta.",
+                 "notificar. A partir de agora só as novidades geram alerta.",
                  len(candidatas))
         return
 
-    # Execuções seguintes: notifica o que for novo
-    novas = [(arq, row, cols, oid) for (arq, row, cols, oid) in candidatas
-             if oid not in ja_notificados]
+    # Detecta novidades e mudanças de fase.
+    eventos = []   # (row, cols, oid, fase)
+    for oid, (row, cols, fase) in candidatas.items():
+        fase_anterior = ofertas_estado.get(oid)
+        if fase_anterior == fase:
+            continue                                  # nada mudou
+        if fase == FASE_ANALISE and fase_anterior == FASE_REGISTRADA:
+            continue                                  # não volta atrás
+        eventos.append((row, cols, oid, fase))
 
-    if not novas:
-        log.info("Nenhuma oferta nova desta vez.")
+    if not eventos:
+        log.info("Nenhuma novidade desta vez.")
         if not dry_run:
+            estado["ofertas"] = ofertas_estado
             estado["primeira_execucao"] = False
             salvar_estado(estado)
         return
 
-    log.info("%d oferta(s) nova(s) encontrada(s).", len(novas))
+    log.info("%d novidade(s) encontrada(s).", len(eventos))
     enviadas = 0
-    for nome_arquivo, row, cols, oid in novas:
-        msg = formatar_mensagem(nome_arquivo, row, cols)
+    for row, cols, oid, fase in eventos:
+        msg = formatar_mensagem(row, cols, fase)
         if dry_run:
-            print("\n----- (DRY-RUN) mensagem que seria enviada -----")
+            print(f"\n----- (DRY-RUN) [{fase}] -----")
             print(msg)
-            print("------------------------------------------------")
-            ja_notificados.add(oid)  # em dry-run marcamos para não repetir no console
+            print("------------------------------")
+            ofertas_estado[oid] = fase
             enviadas += 1
             continue
         if enviar_telegram(msg):
-            ja_notificados.add(oid)
+            ofertas_estado[oid] = fase
             enviadas += 1
-            log.info("Alerta enviado: %s", oid)
-            time.sleep(1)  # respeita o rate limit do Telegram
+            log.info("Alerta enviado [%s]: %s", fase, oid)
+            time.sleep(1)
         else:
-            log.warning("Falha ao enviar (será tentado de novo na próxima): %s", oid)
+            log.warning("Falha ao enviar (será tentado de novo): %s", oid)
 
-    estado["ids_notificados"] = sorted(ja_notificados)
+    estado["ofertas"] = ofertas_estado
     estado["primeira_execucao"] = False
     if not dry_run:
         salvar_estado(estado)
-    log.info("Verificação concluída: %d/%d alertas enviados.", enviadas, len(novas))
+    log.info("Verificação concluída: %d/%d alertas enviados.", enviadas, len(eventos))
 
 
 # -------------------------------------------------------------------
 # Modos auxiliares
 # -------------------------------------------------------------------
 def modo_inspect() -> None:
-    """Baixa os dados e mostra o cabeçalho real + amostras. Não usa Telegram."""
+    """Baixa os dados e analisa a estrutura dos CSVs. Não usa o Telegram."""
     try:
         zip_bytes = baixar_zip(CVM_ZIP_URL)
     except Exception as exc:  # noqa: BLE001
         log.error("Falha no download: %s", exc)
         return
+    limite_data = datetime.now() - timedelta(days=JANELA_DIAS)
+
     for nome_arquivo, header, linhas in ler_csvs_do_zip(zip_bytes):
         cols = detect_columns(header)
-        print("\n" + "=" * 70)
+        print("\n" + "=" * 72)
         print(f"ARQUIVO: {nome_arquivo}   ({len(linhas)} linhas)")
-        print("=" * 70)
-        print("Colunas (cabeçalho real do CSV):")
-        for h in header:
-            print(f"   - {h}")
-        print("\nMapa de colunas detectado pelo robô:")
-        for campo, real in cols.items():
-            print(f"   {campo:<14} -> {real}")
-        faltando = [c for c in COLUMN_CANDIDATES if c not in cols]
-        if faltando:
-            print(f"   (não detectadas: {', '.join(faltando)})")
-        # mostra até 3 linhas de interesse como amostra
-        amostras = [r for r in linhas if linha_interessa(r, cols)][:3]
-        print(f"\nAmostras de ofertas de interesse (até 3 de "
-              f"{sum(1 for r in linhas if linha_interessa(r, cols))}):")
-        for r in amostras:
-            print(f"   • tipo={tipo_detectado(r, cols)!r} | "
-                  f"emissor={r.get(cols.get('emissor',''),'?')!r} | "
-                  f"data={data_da_oferta(r, cols)}")
-        if not amostras:
-            print("   (nenhuma — confira se o filtro de tipo casa com este arquivo)")
+        print("=" * 72)
+
+        print("Mapa de colunas detectado pelo robô:")
+        for campo in COLUMN_CANDIDATES:
+            print(f"   {campo:<16} -> {cols.get(campo, '(não detectada)')}")
+
+        # Descoberta de TODAS as colunas ligadas a coordenadores/distribuidores
+        achadas = [h for h in header
+                   if any(p in norm_header(h) for p in PALAVRAS_COORDENADOR)]
+        print("\nColunas relacionadas a COORDENADORES encontradas no arquivo:")
+        if achadas:
+            for h in achadas:
+                exemplo = ""
+                for row in linhas:
+                    v = str(row.get(h, "") or "").strip()
+                    if v:
+                        exemplo = v
+                        break
+                print(f"   - {h}   (ex.: {exemplo[:70]!r})")
+        else:
+            print("   (nenhuma)")
+
+        # Valores únicos da coluna de STATUS / SITUAÇÃO
+        if "situacao" in cols:
+            valores = Counter(str(r.get(cols["situacao"], "") or "").strip()
+                              for r in linhas)
+            print(f"\nValores da coluna de status ('{cols['situacao']}') "
+                  f"— ocorrências:")
+            for val, qtd in valores.most_common(25):
+                print(f"   {qtd:>7}  {val!r}")
+        else:
+            print("\nColuna de status: (não detectada neste arquivo)")
+
+        # Valores únicos da coluna de RITO
+        if "rito" in cols:
+            valores = Counter(str(r.get(cols["rito"], "") or "").strip()
+                              for r in linhas)
+            print(f"\nValores da coluna de rito ('{cols['rito']}'):")
+            for val, qtd in valores.most_common(10):
+                print(f"   {qtd:>7}  {val!r}")
+
+        # Contagem por tipo monitorado e por fase
+        cont_total = Counter()
+        cont_analise = Counter()
+        cont_reg = Counter()
+        exemplos = {}   # (categoria, fase) -> (row, cols)
+        for row in linhas:
+            cats = categorias_da_linha(row, cols)
+            if not cats:
+                continue
+            fase = fase_da_oferta(row, cols)
+            dref = data_de_referencia(row, cols, fase) if fase else None
+            na_janela = dref is not None and dref >= limite_data
+            for c in cats:
+                cont_total[c] += 1
+                if fase == FASE_ANALISE and na_janela:
+                    cont_analise[c] += 1
+                    exemplos.setdefault((c, FASE_ANALISE), (row, cols))
+                elif fase == FASE_REGISTRADA and na_janela:
+                    cont_reg[c] += 1
+                    exemplos.setdefault((c, FASE_REGISTRADA), (row, cols))
+        print(f"\nOfertas por tipo monitorado "
+              f"(total no arquivo | em análise na janela | registradas na janela):")
+        for c in PADROES_TIPO:
+            print(f"   {c}")
+            print(f"      total: {cont_total[c]:>6}   |   "
+                  f"em análise: {cont_analise[c]:>4}   |   "
+                  f"registradas: {cont_reg[c]:>4}")
+
+        # Exemplos de mensagem
+        print("\nExemplos de mensagem que seriam enviadas:")
+        algum = False
+        for c in PADROES_TIPO:
+            for fase in (FASE_ANALISE, FASE_REGISTRADA):
+                ex = exemplos.get((c, fase))
+                if ex is None:
+                    continue
+                algum = True
+                row, rcols = ex
+                print("\n" + "- " * 26)
+                print(formatar_mensagem(row, rcols, fase))
+        if not algum:
+            print("   (nenhuma oferta na janela agora — normal dependendo do dia)")
 
 
 def modo_test_telegram() -> None:
-    """Envia uma mensagem de teste para validar token e chat_id."""
     msg = ("✅ <b>Robô CVM → Telegram</b>\n\n"
-           "Teste de conexão bem-sucedido. "
-           "Você receberá um alerta aqui sempre que uma nova oferta de "
-           "CRA, CRI, debênture ou nota comercial for registrada na CVM.")
+           "Teste de conexão bem-sucedido. Você receberá um alerta aqui "
+           "quando um pedido de oferta de CRA, CRI, debênture ou nota "
+           "comercial entrar em análise — e outro quando for registrada.")
     if enviar_telegram(msg):
         log.info("Mensagem de teste enviada com sucesso. ✅")
     else:
@@ -594,20 +772,20 @@ def modo_test_telegram() -> None:
 # -------------------------------------------------------------------
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Robô que avisa no Telegram sobre novas ofertas (CRA, CRI, "
-                    "debêntures, notas comerciais) registradas na CVM.")
+        description="Robô que avisa no Telegram sobre pedidos em análise e "
+                    "ofertas registradas (CRA, CRI, debêntures, notas "
+                    "comerciais) na CVM.")
     parser.add_argument("--loop", action="store_true",
-                        help="roda continuamente, verificando a cada "
-                             f"{POLL_INTERVAL_SECONDS}s")
+                        help=f"roda continuamente, a cada {POLL_INTERVAL_SECONDS}s")
     parser.add_argument("--dry-run", action="store_true",
                         help="verifica e imprime as mensagens em vez de enviar")
     parser.add_argument("--inspect", action="store_true",
-                        help="baixa os dados e mostra as colunas reais do CSV")
+                        help="baixa os dados e analisa a estrutura dos CSVs")
     parser.add_argument("--test-telegram", action="store_true",
                         help="envia uma mensagem de teste para o Telegram")
     parser.add_argument("--notify-on-first-run", action="store_true",
                         help="na primeira execução, notifica tudo que está na "
-                             "janela (padrão: só semeia o estado, sem notificar)")
+                             "janela (padrão: só semeia o estado)")
     args = parser.parse_args()
 
     if args.inspect:
