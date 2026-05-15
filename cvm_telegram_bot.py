@@ -57,6 +57,7 @@ import re
 import sys
 import time
 import unicodedata
+import urllib.parse
 import zipfile
 from collections import Counter
 from datetime import datetime, timedelta
@@ -126,7 +127,18 @@ BASE_DIR = Path(__file__).resolve().parent
 STATE_FILE = BASE_DIR / "estado_ofertas.json"
 LOG_FILE = BASE_DIR / "cvm_robo.log"
 
+# Link genérico do sistema SRE — usado como fallback quando o processo não vem.
 LINK_CONSULTA = "https://web.cvm.gov.br/sre-publico-cvm/#/consulta-oferta-publica"
+
+
+def link_busca_google(numero_processo: str) -> str:
+    """Monta um link de busca exata no Google pelo número de processo
+    (ex.: SRE/1455/2026). Costuma trazer a página da própria oferta no
+    primeiro resultado: prospecto, anúncio de início, ou a tela do SRE."""
+    if not numero_processo:
+        return ""
+    termo = f'"{numero_processo}" CVM SRE oferta'
+    return "https://www.google.com/search?q=" + urllib.parse.quote(termo)
 
 # ===================================================================
 # Fim da configuração — daqui pra baixo é o motor do robô.
@@ -551,7 +563,17 @@ def formatar_mensagem(row: dict, cols: dict, fase: str) -> str:
         linhas.append(f"🔢 <b>Nº registro/requerimento:</b> {nro_registro}")
     if processo:
         linhas.append(f"🗂️ <b>Processo:</b> {processo}")
-    linhas += ["", f'🔗 <a href="{LINK_CONSULTA}">Consultar no sistema SRE</a>']
+
+    # Link: se há número de processo, busca exata no Google (costuma cair na
+    # página da própria oferta). Se não houver, cai no link genérico do SRE.
+    processo_cru = _campo(row, cols, "numero")
+    if processo_cru:
+        url = link_busca_google(processo_cru)
+        rotulo = "Buscar no Google (CVM/SRE)"
+    else:
+        url = LINK_CONSULTA
+        rotulo = "Consultar no sistema SRE"
+    linhas += ["", f'🔗 <a href="{url}">{rotulo}</a>']
     return "\n".join(linhas)
 
 
