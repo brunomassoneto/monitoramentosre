@@ -228,6 +228,12 @@ COLUMN_CANDIDATES = {
     # OBS.: o conjunto de dados público da CVM NÃO traz a lista completa dos
     # demais coordenadores/consórcio — só o líder e a categoria dele.
     "grupo_coordenador": ["grupocoordenador"],
+    # Em CRA/CRI o emissor é a securitizadora; o RISCO da operação é do
+    # devedor lastro. Esta coluna costuma trazer essa informação.
+    "devedor": [
+        "identificacaodevedorescoobrigados", "identificacaodevedores",
+        "devedorescoobrigados", "devedores", "devedor",
+    ],
     "publico_alvo": ["publicoalvo", "publico"],
 }
 
@@ -495,6 +501,7 @@ def formatar_mensagem(row: dict, cols: dict, fase: str) -> str:
     emissor = html_escape(_campo(row, cols, "emissor") or "(não informado)")
     lider = html_escape(_campo(row, cols, "lider"))
     grupo_coord = html_escape(_campo(row, cols, "grupo_coordenador"))
+    devedor = html_escape(_campo(row, cols, "devedor"))
     processo = html_escape(_campo(row, cols, "numero"))
     nro_registro = html_escape(_campo(row, cols, "numero_registro"))
     rito = html_escape(_campo(row, cols, "rito"))
@@ -519,6 +526,12 @@ def formatar_mensagem(row: dict, cols: dict, fase: str) -> str:
         f"📄 <b>Tipo:</b> {tipo}",
         f"🏢 <b>Emissor:</b> {emissor}",
     ]
+    # Devedor (risco da operação) só faz sentido em CRA/CRI — em debênture
+    # e nota comercial o próprio emissor já é o devedor.
+    categorias = categorias_da_linha(row, cols)
+    eh_cri_cra = any("CRA" in c or "CRI" in c for c in categorias)
+    if eh_cri_cra and devedor:
+        linhas.append(f"🎯 <b>Devedor (risco):</b> {devedor}")
     if lider:
         linhas.append(f"🏦 <b>Coordenador líder:</b> {lider}")
     if grupo_coord:
@@ -717,6 +730,33 @@ def modo_inspect() -> None:
             print(f"\nValores da coluna de rito ('{cols['rito']}'):")
             for val, qtd in valores.most_common(10):
                 print(f"   {qtd:>7}  {val!r}")
+
+        # Coluna de DEVEDOR (risco em CRA/CRI): mostra se vem preenchida
+        # na prática e dá amostras reais.
+        if "devedor" in cols:
+            preench = 0
+            amostras_cri_cra = []
+            for row in linhas:
+                v = str(row.get(cols["devedor"], "") or "").strip()
+                if v:
+                    preench += 1
+                    cats = categorias_da_linha(row, cols)
+                    if (any("CRA" in c or "CRI" in c for c in cats)
+                            and len(amostras_cri_cra) < 8):
+                        amostras_cri_cra.append((row.get(cols.get("emissor", ""), "?"),
+                                                 v))
+            print(f"\nColuna de devedor ('{cols['devedor']}'): {preench}/{len(linhas)} "
+                  f"linhas preenchidas")
+            if amostras_cri_cra:
+                print("Amostras de devedor em CRA/CRI:")
+                for emissor, dev in amostras_cri_cra:
+                    dev_curto = dev[:90] + ("…" if len(dev) > 90 else "")
+                    print(f"   emissor: {str(emissor)[:40]!r:42}  ->  devedor: {dev_curto!r}")
+            else:
+                print("   (sem amostras de CRA/CRI com devedor preenchido neste arquivo)")
+        else:
+            print("\nColuna de devedor: (não detectada neste arquivo — esperado para "
+                  "oferta_distribuicao.csv)")
 
         # Contagem por tipo monitorado e por fase
         cont_total = Counter()
