@@ -1,309 +1,915 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Testa o motor do robô (versão SRE) com dados simulados no formato EXATO da
-API do SRE (confirmado pelo teste de acesso no GitHub Actions).
+Robô CVM → Telegram  (fonte: API do SRE)
+========================================
+
+Monitora as ofertas públicas de distribuição na CVM e publica alertas em um
+canal do Telegram quando:
+  - um NOVO PEDIDO de oferta entra em análise; e
+  - uma oferta é REGISTRADA.
+
+A mesma oferta pode gerar dois alertas ao longo do ciclo:
+"📥 em análise"  ->  "✅ registrada".
+
+Tipos monitorados: CRA, CRI, Debêntures e Notas Comerciais.
+
+Fonte de dados — principal
+--------------------------
+API do sistema SRE (a mesma que alimenta a tela pública de consulta):
+
+  POST  https://web.cvm.gov.br/sre-publico-cvm/rest/sitePublico/pesquisar/detalhado
+        -> lista paginada de ofertas, ordenável por data (mais recentes primeiro).
+  GET   https://web.cvm.gov.br/sre-publico-cvm/rest/sitePublico/pesquisar/infOferta/{id}
+        -> detalhe de uma oferta (lista de pares {campoNome, valor}); é daqui
+           que sai o "devedor" (risco) em CRA/CRI.
+
+Vantagem: dados atualizados em tempo quase real (sem a defasagem de dias do
+Portal de Dados Abertos).
+
+Atenção/fragilidade: esta API é interna do site da CVM, não é documentada nem
+tem contrato público de estabilidade. Pode mudar de formato ou passar a
+bloquear acesso automatizado sem aviso. Por isso o robô tem uma FONTE DE
+RESERVA (ver abaixo).
+
+Fonte de dados — reserva (fallback)
+-----------------------------------
+Se a API do SRE falhar (timeout, bloqueio, formato inesperado), o robô tenta
+o Portal de Dados Abertos da CVM (arquivo .zip, fonte oficial e estável, mas
+defasada). Nesse caso ele envia um aviso de "modo reserva" no Telegram, para
+você saber que os dados podem estar atrasados e que a fonte principal
+precisa de atenção.
+
+Como usar
+---------
+    python cvm_telegram_bot.py --inspect        # baixa e analisa a estrutura da API
+    python cvm_telegram_bot.py --test-telegram  # envia uma mensagem de teste
+    python cvm_telegram_bot.py                  # uma verificação (cron/Actions)
+    python cvm_telegram_bot.py --loop           # roda continuamente
+    python cvm_telegram_bot.py --dry-run        # verifica mas imprime em vez de enviar
 """
+
+import argparse
+import hashlib
+import io
 import json
+import logging
+import os
+import re
+import sys
+import time
+import unicodedata
+import urllib.parse
+import zipfile
+from collections import Counter
+from datetime import datetime, timedelta
+from pathlib import Path
 
-import cvm_telegram_bot as bot
-
-HOJE = bot.datetime.now()
-
-
-def d(dias_atras):
-    return (HOJE - bot.timedelta(days=dias_atras)).strftime("%d/%m/%Y")
+try:
+    import requests
+except ImportError:
+    sys.exit("Falta a biblioteca 'requests'. Instale com:  pip install requests")
 
 
-# Registros no formato REAL da API /detalhado
-def reg(idr, tipo, emissor, lider, status, dias, valor="0,0000",
-        processo=None, modalidade="PRIMARIA", rito="OPD Aut"):
+# ===================================================================
+# CONFIGURAÇÃO
+# ===================================================================
+
+# --- Telegram ---------------------------------------------------------
+# No GitHub Actions estes valores vêm dos "Secrets" — NÃO escreva o token
+# aqui se o código for para um repositório.
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "COLE_AQUI_O_TOKEN_DO_BOT")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "COLE_AQUI_O_CHAT_ID")
+
+# --- O que monitorar --------------------------------------------------
+# Padrões (regex) que casam SEM acento e SEM diferenciar maiúsculas. Casam
+# singular e plural. Para monitorar só um tipo, deixe só a entrada desejada.
+PADROES_TIPO = {
+    "CRA — Certificado de Recebíveis do Agronegócio": [
+        r"\bcra\b", r"recebiveis\s+do\s+agronegocio",
+    ],
+    "CRI — Certificado de Recebíveis Imobiliários": [
+        r"\bcri\b", r"recebiveis\s+imobiliari",
+    ],
+    "Debêntures": [
+        r"\bdebentur",
+    ],
+    "Notas Comerciais": [
+        r"\bnotas?\s+comerci", r"\bnota\s+promissoria",
+    ],
+}
+
+# Avisar também quando um pedido ENTRA EM ANÁLISE (além do alerta de registro)?
+ALERTAR_EM_ANALISE = True
+
+# Status (de statusDaOferta) que indicam pedido encerrado SEM registro —
+# ignorados. Calibrado a partir dos valores reais vistos na API/CSV.
+STATUS_TERMINAIS = [
+    "cancel", "indefer", "desist", "arquivad", "revog",
+    "negad", "extint", "caduc", "interromp", "expir",
+]
+
+# Status que indicam oferta REGISTRADA / concedida.
+STATUS_REGISTRADA = ["registro concedido", "registrada", "oferta encerrada",
+                     "concedido", "deferid"]
+
+# --- Comportamento ----------------------------------------------------
+POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "3600"))
+
+# Janela: só considera ofertas com data dentro dos últimos N dias.
+JANELA_DIAS = int(os.environ.get("JANELA_DIAS", "45"))
+
+# Quantas ofertas recentes buscar por verificação (a API entrega ordenado por
+# data desc, então as mais novas vêm primeiro). 200 cobre vários dias de
+# sobra; aumente se o robô ficar muito tempo sem rodar.
+QTD_OFERTAS_VERIFICAR = int(os.environ.get("QTD_OFERTAS_VERIFICAR", "200"))
+
+# --- Fontes de dados --------------------------------------------------
+SRE_BASE = "https://web.cvm.gov.br/sre-publico-cvm"
+SRE_API = SRE_BASE + "/rest/sitePublico/pesquisar"
+SRE_API_LISTA = SRE_API + "/detalhado"
+SRE_API_DETALHE = SRE_API + "/infOferta/{id}"
+SRE_API_PARTICIPANTES = SRE_API + "/participantes/{id}"
+SRE_LINK_OFERTA = SRE_BASE + "/#/oferta-publica/{id}"
+
+# Fonte de reserva (Portal de Dados Abertos).
+CVM_ZIP_URL = "https://dados.cvm.gov.br/dados/OFERTA/DISTRIB/DADOS/oferta_distribuicao.zip"
+
+BASE_DIR = Path(__file__).resolve().parent
+STATE_FILE = BASE_DIR / "estado_ofertas.json"
+LOG_FILE = BASE_DIR / "cvm_robo.log"
+
+# ===================================================================
+# Fim da configuração.
+# ===================================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+    ],
+)
+log = logging.getLogger("cvm-robo")
+
+_PADROES_COMPILADOS = {
+    cat: [re.compile(p) for p in padroes]
+    for cat, padroes in PADROES_TIPO.items()
+}
+
+FASE_ANALISE = "analise"
+FASE_REGISTRADA = "registrada"
+
+HEADERS_NAVEGADOR = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/124.0.0.0 Safari/537.36"),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+    "Content-Type": "application/json",
+    "Origin": "https://web.cvm.gov.br",
+    "Referer": SRE_BASE + "/",
+    "Connection": "keep-alive",
+}
+
+# Nome do campo, no detalhe (infOferta), que traz o devedor. A busca é feita
+# de forma flexível (sem acento, por trecho), então variações são toleradas.
+CAMPO_DEVEDOR_CONTEM = "devedores"
+
+
+# -------------------------------------------------------------------
+# Utilitários de texto
+# -------------------------------------------------------------------
+def strip_accents(texto: str) -> str:
+    nfkd = unicodedata.normalize("NFKD", texto)
+    return "".join(c for c in nfkd if not unicodedata.combining(c))
+
+
+def normalize(texto) -> str:
+    if texto is None:
+        return ""
+    t = strip_accents(str(texto)).lower()
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def html_escape(texto) -> str:
+    return (str(texto).replace("&", "&amp;")
+            .replace("<", "&lt;").replace(">", "&gt;"))
+
+
+# -------------------------------------------------------------------
+# Classificação de tipo e fase
+# -------------------------------------------------------------------
+def categorias_do_texto(texto: str) -> list:
+    """Categorias monitoradas que casam com o texto do tipo de valor mobiliário."""
+    txt = normalize(texto)
+    if not txt:
+        return []
+    achadas = []
+    for cat, padroes in _PADROES_COMPILADOS.items():
+        if any(p.search(txt) for p in padroes):
+            achadas.append(cat)
+    return achadas
+
+
+def fase_do_status(status: str):
+    """
+    Classifica a fase a partir do texto de status da oferta:
+      FASE_REGISTRADA / FASE_ANALISE / None (ignorar).
+    """
+    st = normalize(status)
+    if not st:
+        return None
+    if any(t in st for t in STATUS_TERMINAIS):
+        return None
+    if any(r in st for r in STATUS_REGISTRADA):
+        return FASE_REGISTRADA
+    # qualquer outro status ativo (ex.: "aguardando bookbuilding",
+    # "em análise") é tratado como pedido em análise.
+    return FASE_ANALISE if ALERTAR_EM_ANALISE else None
+
+
+# -------------------------------------------------------------------
+# Datas
+# -------------------------------------------------------------------
+def parse_data(valor):
+    if not valor:
+        return None
+    s = str(valor).strip()
+    if not s or s.lower() in ("nan", "none", "null"):
+        return None
+    s_data = s.split(" ")[0].split("T")[0]
+    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(s_data, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+# -------------------------------------------------------------------
+# Modelo de oferta (normalizado, independente da fonte)
+# -------------------------------------------------------------------
+class Oferta:
+    """Representa uma oferta de forma uniforme, venha do SRE ou do fallback."""
+
+    __slots__ = ("id", "processo", "protocolo", "tipo", "emissor",
+                 "lider", "data", "status", "valor", "modalidade",
+                 "rito", "categorias", "fase", "devedor", "coordenadores",
+                 "fonte")
+
+    def __init__(self):
+        self.id = ""
+        self.processo = ""
+        self.protocolo = ""
+        self.tipo = ""
+        self.emissor = ""
+        self.lider = ""
+        self.data = None          # datetime
+        self.status = ""
+        self.valor = ""
+        self.modalidade = ""
+        self.rito = ""
+        self.categorias = []
+        self.fase = None
+        self.devedor = ""
+        self.coordenadores = []   # lista de nomes (demais coordenadores)
+        self.fonte = "SRE"
+
+    def chave(self) -> str:
+        """ID estável para deduplicação."""
+        if self.processo:
+            return f"proc:{self.processo.strip()}"
+        if self.id:
+            return f"id:{self.id}"
+        bruto = f"{self.tipo}|{self.emissor}|{self.data}"
+        return "hash:" + hashlib.sha1(bruto.encode("utf-8", "replace")).hexdigest()[:16]
+
+    def eh_cri_cra(self) -> bool:
+        return any("CRA" in c or "CRI" in c for c in self.categorias)
+
+
+# -------------------------------------------------------------------
+# FONTE PRINCIPAL — API do SRE
+# -------------------------------------------------------------------
+def _nova_sessao() -> requests.Session:
+    """Cria uma sessão HTTP; visita a home do SRE para obter cookie de sessão."""
+    sess = requests.Session()
+    sess.headers.update(HEADERS_NAVEGADOR)
+    try:
+        sess.get(SRE_BASE + "/", timeout=60)   # pega JSESSIONID, se houver
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Não consegui visitar a home do SRE (seguindo mesmo assim): %s", exc)
+    return sess
+
+
+def _payload_lista(pagina: int, tamanho: int) -> dict:
+    """Monta o corpo do POST /detalhado para uma página de resultados."""
+    hoje = datetime.now()
+    de = (hoje - timedelta(days=max(JANELA_DIAS * 2, 120))).strftime("%d/%m/%Y")
+    ate = (hoje + timedelta(days=1)).strftime("%d/%m/%Y")
+    periodo = {"de": de, "ate": ate}
     return {
-        "idRequerimento": idr,
-        "numeroProcesso": processo or f"SRE/{idr}/2026",
-        "numeroProtocolo": f"{idr}/2026",
-        "nomeValorMobiliario": tipo,
-        "tipoDeOferta": modalidade,
-        "statusDaOferta": status,
-        "nomeEmissor": emissor,
-        "cnpjEmissor": "00.000.000/0001-00",
-        "nomeCoordenadorLider": lider,
-        "cnpjCoordenadorLider": "11.111.111/0001-11",
-        "nomeTipoRequerimento": rito,
-        "valorTotalEmReais": valor,
-        "data": d(dias),
-        "registroAutomatico": True,
-        "totalRegistros": 999,
+        "periodoCriacaoProcesso": periodo,
+        "periodoCriacaoRequerimento": periodo,
+        "opa": False,
+        "modalidade": "TODAS",
+        "tipoOferta": "OFERTA_REGULAR",
+        "colunaOrdenacao": "data",
+        "direcaoOrdenacao": "DESC",
+        "pagina": pagina,
+        "tamanhoPagina": str(tamanho),
     }
 
 
-LISTA_R1 = [
-    reg("26335", "Debêntures", "ECO101 RODOVIAS S.A.", "BANCO BRADESCO BBI S.A.",
-        "Aguardando Bookbuilding", 2, "2.400.000.000,0000"),
-    reg("26300", "Certificados de Recebíveis Imobiliários", "OPEA SECURITIZADORA S.A.",
-        "ITAU BBA", "Registro Concedido", 5, "500.000.000,0000"),
-    reg("26280", "Certificados de Recebíveis do Agronegócio", "ECO SECURITIZADORA",
-        "BANCO BOCOM BBM", "Aguardando Bookbuilding", 3, "0,0000"),
-    reg("26250", "Notas Comerciais", "PROFARMA S.A.", "CAIXA ECONOMICA",
-        "Registro Concedido", 8, "200.000.000,0000"),
-    # Ações -> ignora
-    reg("26240", "Ações Ordinárias", "TECH S.A.", "BANCO X",
-        "Registro Concedido", 4, "1.000.000.000,0000"),
-    # Debênture cancelada -> ignora
-    reg("26230", "Debêntures", "CANCELADA S.A.", "BANCO Y",
-        "Oferta Cancelada", 3),
-    # CRI antigo (fora da janela de 45 dias) -> ignora
-    reg("25000", "Certificados de Recebíveis Imobiliários", "VELHA SEC S.A.",
-        "BANCO Z", "Registro Concedido", 400, "100.000.000,0000"),
-]
-
-# Detalhe (infOferta) no formato real: lista de {codigo, campoNome, valor}
-DETALHES = {
-    "26280": [
-        {"codigo": 26280, "campoNome": "Emissão nº", "valor": "12"},
-        {"codigo": 26280, "campoNome": "Tipo de lastro", "valor": "Concentrado"},
-        {"codigo": 26280, "campoNome": "Identificação dos devedores e coobrigados",
-         "valor": "USINA SãO JOãO AÇÚCAR E ÁLCOOL S.A. (devedora)"},
-        {"codigo": 26280, "campoNome": "Destinação dos recursos", "valor": "..."},
-    ],
-    "26300": [
-        {"codigo": 26300, "campoNome": "Emissão nº", "valor": "143"},
-        {"codigo": 26300, "campoNome": "Identificação dos devedores e coobrigados",
-         "valor": "ALLOS S.A."},
-    ],
-}
-
-# Participantes (participantes/{id}) no formato real: lista de objetos
-# com idParticipante, razaoSocial, cnpjInstituicao, tipo.
-PARTICIPANTES = {
-    "26335": [   # debênture ECO101 — líder Bradesco + 3 coordenadores + emissor
-        {"idParticipante": "1", "razaoSocial": "BANCO BRADESCO BBI S.A.",
-         "cnpjInstituicao": "06.271.464/0001-19", "tipo": "COORDENADOR"},
-        {"idParticipante": "2", "razaoSocial": "ITAU BBA ASSESSORIA FINANCEIRA S.A",
-         "cnpjInstituicao": "04.845.753/0001-59", "tipo": "COORDENADOR"},
-        {"idParticipante": "3", "razaoSocial": "BANCO SANTANDER (BRASIL) S.A.",
-         "cnpjInstituicao": "90.400.888/0001-42", "tipo": "COORDENADOR"},
-        {"idParticipante": "4", "razaoSocial": "XP INVESTIMENTOS CCTVM S.A.",
-         "cnpjInstituicao": "02.332.886/0001-04", "tipo": "COORDENADOR"},
-        {"idParticipante": "5", "razaoSocial": "ECO101 RODOVIAS S.A.",
-         "cnpjInstituicao": "00.000.000/0001-00", "tipo": "EMISSOR"},
-    ],
-    "26300": [   # CRI com só o líder, sem demais coordenadores
-        {"idParticipante": "9", "razaoSocial": "ITAU BBA",
-         "cnpjInstituicao": "04.845.753/0001-59", "tipo": "COORDENADOR"},
-    ],
-}
+def sre_listar_ofertas(sess: requests.Session, limite: int) -> list:
+    """
+    Busca as ofertas mais recentes via POST /detalhado, paginando até atingir
+    'limite' registros. Devolve uma lista de dicts crus da API.
+    Lança exceção se a API falhar — o chamador trata o fallback.
+    """
+    por_pagina = 50
+    coletados = []
+    pagina = 1
+    while len(coletados) < limite:
+        payload = _payload_lista(pagina, por_pagina)
+        resp = sess.post(SRE_API_LISTA, json=payload, timeout=60)
+        if resp.status_code != 200:
+            raise RuntimeError(f"SRE /detalhado devolveu HTTP {resp.status_code}")
+        data = resp.json()
+        registros = data.get("registros", [])
+        if not registros:
+            break
+        coletados.extend(registros)
+        total_paginas = data.get("totalPaginas", pagina)
+        if pagina >= total_paginas:
+            break
+        pagina += 1
+        time.sleep(0.5)   # educado com o servidor
+    return coletados[:limite]
 
 
-# --- substitui as chamadas de rede por dados simulados --------------
-class FakeSession:
-    def post(self, url, json=None, timeout=None):
-        return FakeResp(200, {"totalRegistros": len(_LISTA), "totalPaginas": 1,
-                              "pagina": 1, "registros": _LISTA})
-
-    def get(self, url, timeout=None):
-        # extrai o id do final da URL e roteia conforme o endpoint
-        idr = url.rstrip("/").split("/")[-1]
-        if "/participantes/" in url:
-            return FakeResp(200, PARTICIPANTES.get(idr, []))
-        return FakeResp(200, DETALHES.get(idr, []))
-
-
-class FakeResp:
-    def __init__(self, status, data):
-        self.status_code = status
-        self._data = data
-        self.text = json.dumps(data)
-        self.headers = {"content-type": "application/json"}
-
-    def json(self):
-        return self._data
-
-    def raise_for_status(self):
-        pass
+def sre_detalhe_devedor(sess: requests.Session, id_req: str) -> str:
+    """
+    Busca o detalhe da oferta (GET /infOferta/{id}) e extrai o campo do
+    devedor. Devolve '' se não encontrar ou se a chamada falhar (o devedor
+    é um 'extra' — sua ausência não impede o alerta).
+    """
+    if not id_req:
+        return ""
+    try:
+        url = SRE_API_DETALHE.format(id=urllib.parse.quote(str(id_req)))
+        resp = sess.get(url, timeout=60)
+        if resp.status_code != 200:
+            log.warning("infOferta/%s devolveu HTTP %s", id_req, resp.status_code)
+            return ""
+        itens = resp.json()
+        if not isinstance(itens, list):
+            return ""
+        for item in itens:
+            nome = normalize(item.get("campoNome", ""))
+            if CAMPO_DEVEDOR_CONTEM in nome:
+                return str(item.get("valor", "") or "").strip()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Falha ao buscar devedor da oferta %s: %s", id_req, exc)
+    return ""
 
 
-_LISTA = LISTA_R1
-bot._nova_sessao = lambda: FakeSession()
+def sre_coordenadores(sess: requests.Session, id_req: str, lider: str) -> list:
+    """
+    Busca os participantes da oferta (GET /participantes/{id}) e devolve a
+    lista de COORDENADORES, excluindo o coordenador líder (que já é exibido
+    em separado) e sem repetições.
 
-if bot.STATE_FILE.exists():
-    bot.STATE_FILE.unlink()
-enviadas = []
-bot.enviar_telegram = lambda texto: enviadas.append(texto) or True
-
-print("\n##### TESTE 1: parsing de um registro da API #####")
-o = bot.sre_registro_para_oferta(LISTA_R1[0])
-assert o.id == "26335"
-assert o.processo == "SRE/26335/2026"
-assert o.tipo == "Debêntures"
-assert o.emissor == "ECO101 RODOVIAS S.A."
-assert o.lider == "BANCO BRADESCO BBI S.A."
-assert o.categorias == ["Debêntures"]
-assert o.fase == bot.FASE_ANALISE     # "Aguardando Bookbuilding"
-assert o.data is not None
-print(f"  id={o.id} tipo={o.tipo!r} fase={o.fase} OK ✅")
-
-print("\n##### TESTE 2: classificação de fase por status #####")
-casos = [
-    ("Aguardando Bookbuilding", bot.FASE_ANALISE),
-    ("Registro Concedido", bot.FASE_REGISTRADA),
-    ("Oferta Encerrada", bot.FASE_REGISTRADA),
-    ("Oferta Cancelada", None),
-    ("Registro Caducado", None),
-    ("Requerimento Expirado", None),
-    ("", None),
-]
-for status, esperado in casos:
-    got = bot.fase_do_status(status)
-    status_ok = "✅" if got == esperado else "❌"
-    print(f"  {status_ok}  {status!r:30} -> {got} (esperado {esperado})")
-    assert got == esperado
-print("OK ✅")
-
-print("\n##### TESTE 3: tipos — singular/plural e exclusões #####")
-for tipo, deve in [
-    ("Debêntures", True), ("Debênture", True),
-    ("Certificados de Recebíveis Imobiliários", True),
-    ("Certificado de Recebíveis do Agronegócio", True),
-    ("Notas Comerciais", True), ("Nota Comercial", True),
-    ("Ações Ordinárias", False), ("Cotas de FII", False),
-]:
-    got = bool(bot.categorias_do_texto(tipo))
-    assert got == deve, f"falhou em {tipo!r}"
-print("OK ✅")
-
-print("\n##### TESTE 4: primeira execução semeia, não notifica #####")
-bot.verificar(dry_run=False)
-assert len(enviadas) == 0
-estado = json.loads(bot.STATE_FILE.read_text(encoding="utf-8"))
-# de interesse na janela: Deb + CRI + CRA + NC = 4 (ações/cancelada/antigo fora)
-print(f"  Ofertas semeadas: {len(estado['ofertas'])} (esperado: 4)")
-assert len(estado["ofertas"]) == 4
-print("OK ✅")
-
-print("\n##### TESTE 5: 2ª execução sem mudanças -> nada enviado #####")
-enviadas.clear()
-bot.verificar(dry_run=False)
-assert len(enviadas) == 0
-print("OK ✅")
-
-print("\n##### TESTE 6: novo CRA em análise -> alerta com DEVEDOR #####")
-_LISTA = LISTA_R1 + [reg("26280", "Certificados de Recebíveis do Agronegócio",
-                         "ECO SECURITIZADORA", "BANCO BOCOM BBM",
-                         "Aguardando Bookbuilding", 1, "0,0000",
-                         processo="SRE/99999/2026")]
-# obs: novo processo único para contar como nova oferta
-enviadas.clear()
-bot.verificar(dry_run=False)
-print(f"  Mensagens: {len(enviadas)} (esperado: 1)")
-assert len(enviadas) == 1
-msg = enviadas[0]
-assert "em análise" in msg.lower()
-assert "Devedor (risco)" in msg, "CRA novo deveria trazer devedor"
-assert "USINA S" in msg, "devedor real deveria aparecer"
-assert "oferta-publica/26280" in msg, "link direto da oferta deveria aparecer"
-print("  ---- mensagem ----")
-print(msg)
-print("  ------------------")
-print("OK ✅")
-
-print("\n##### TESTE 7: CRI registrado traz devedor; debênture NÃO #####")
-bot.STATE_FILE.unlink(missing_ok=True)
-_LISTA = LISTA_R1
-enviadas.clear()
-bot.verificar(dry_run=False, notificar_primeira=True)
-msg_cri = [m for m in enviadas if "OPEA" in m][0]
-msg_deb = [m for m in enviadas if "ECO101" in m][0]
-assert "Devedor (risco)" in msg_cri and "ALLOS S.A." in msg_cri
-assert "Devedor (risco)" not in msg_deb, "debênture não tem devedor separado"
-assert not any("CANCELADA" in m for m in enviadas)
-assert not any("VELHA SEC" in m for m in enviadas)
-assert not any("TECH S.A." in m for m in enviadas)
-print(f"  Alertas: {len(enviadas)} (esperado: 4)")
-assert len(enviadas) == 4
-print("OK ✅")
-
-print("\n##### TESTE 8: demais coordenadores do consórcio #####")
-# função isolada: a debênture 26335 tem líder Bradesco + 3 coords + 1 emissor
-coords = bot.sre_coordenadores(FakeSession(), "26335", "BANCO BRADESCO BBI S.A.")
-print(f"  Coordenadores (excluindo líder): {coords}")
-assert "ITAU BBA ASSESSORIA FINANCEIRA S.A" in coords
-assert "BANCO SANTANDER (BRASIL) S.A." in coords
-assert "XP INVESTIMENTOS CCTVM S.A." in coords
-assert not any("BRADESCO" in c for c in coords), "o líder não deve repetir na lista"
-assert not any("ECO101" in c for c in coords), "o emissor (tipo!=COORDENADOR) deve sair"
-assert len(coords) == 3
-# numa oferta só com o líder, a lista de demais coordenadores fica vazia
-coords_vazio = bot.sre_coordenadores(FakeSession(), "26300", "ITAU BBA")
-assert coords_vazio == [], "só o líder -> sem demais coordenadores"
-# e na mensagem completa, a linha deve aparecer
-bot.STATE_FILE.unlink(missing_ok=True)
-_LISTA = LISTA_R1
-enviadas.clear()
-bot.verificar(dry_run=False, notificar_primeira=True)
-msg_deb = [m for m in enviadas if "ECO101" in m][0]
-assert "Demais coordenadores" in msg_deb
-assert "ITAU BBA" in msg_deb and "SANTANDER" in msg_deb and "XP INVESTIMENTOS" in msg_deb
-print("  ---- trecho da mensagem (debênture ECO101) ----")
-for ln in msg_deb.split("\n"):
-    if "oordenador" in ln:
-        print("   " + ln)
-print("OK ✅ (demais coordenadores aparecem, líder e emissor filtrados)")
-
-print("\n##### TESTE 9: fallback quando a API do SRE falha #####")
-bot.STATE_FILE.unlink(missing_ok=True)
+    Devolve [] se não encontrar ou se a chamada falhar — os coordenadores
+    são um 'extra'; sua ausência não impede o alerta.
+    """
+    if not id_req:
+        return []
+    try:
+        url = SRE_API_PARTICIPANTES.format(id=urllib.parse.quote(str(id_req)))
+        resp = sess.get(url, timeout=60)
+        if resp.status_code != 200:
+            log.warning("participantes/%s devolveu HTTP %s", id_req, resp.status_code)
+            return []
+        itens = resp.json()
+        if not isinstance(itens, list):
+            return []
+        lider_norm = normalize(lider)
+        nomes = []
+        vistos = set()
+        for item in itens:
+            # só interessa quem tem papel de coordenador
+            if "coordenador" not in normalize(item.get("tipo", "")):
+                continue
+            nome = str(item.get("razaoSocial", "") or "").strip()
+            if not nome:
+                continue
+            nome_norm = normalize(nome)
+            if nome_norm == lider_norm:      # o líder já aparece em separado
+                continue
+            if nome_norm in vistos:          # evita repetição
+                continue
+            vistos.add(nome_norm)
+            nomes.append(nome)
+        return nomes
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Falha ao buscar coordenadores da oferta %s: %s", id_req, exc)
+    return []
 
 
-class SessaoQuebrada:
-    def post(self, *a, **k):
-        return FakeResp(403, "Forbidden")
-
-    def get(self, *a, **k):
-        return FakeResp(403, "Forbidden")
-
-
-bot._nova_sessao = lambda: SessaoQuebrada()
-# simula o fallback devolvendo 2 ofertas
-def fake_fallback():
-    o1 = bot.Oferta()
-    o1.fonte = "Dados Abertos (reserva)"
-    o1.tipo = "Debêntures"
-    o1.categorias = ["Debêntures"]
-    o1.emissor = "EMISSOR RESERVA S.A."
-    o1.processo = "SRE/7777/2026"
-    o1.status = "Registro Concedido"
-    o1.fase = bot.FASE_REGISTRADA
-    o1.data = HOJE
-    return [o1]
+def sre_registro_para_oferta(reg: dict) -> Oferta:
+    """Converte um registro cru da API /detalhado no modelo Oferta."""
+    o = Oferta()
+    o.fonte = "SRE"
+    o.id = str(reg.get("idRequerimento", "") or "").strip()
+    o.processo = str(reg.get("numeroProcesso", "") or "").strip()
+    o.protocolo = str(reg.get("numeroProtocolo", "") or "").strip()
+    o.tipo = str(reg.get("nomeValorMobiliario", "") or "").strip()
+    o.emissor = str(reg.get("nomeEmissor", "") or "").strip()
+    o.lider = str(reg.get("nomeCoordenadorLider", "") or "").strip()
+    o.status = str(reg.get("statusDaOferta", "") or "").strip()
+    o.modalidade = str(reg.get("tipoDeOferta", "") or "").strip()
+    o.rito = str(reg.get("nomeTipoRequerimento", "") or "").strip()
+    o.valor = str(reg.get("valorTotalEmReais", "") or "").strip()
+    o.data = parse_data(reg.get("data"))
+    o.categorias = categorias_do_texto(o.tipo)
+    o.fase = fase_do_status(o.status)
+    return o
 
 
-bot.coletar_do_fallback = fake_fallback
-enviadas.clear()
-bot.verificar(dry_run=False, notificar_primeira=True)
-# deve ter: 1 aviso de modo reserva + 1 alerta da oferta
-assert any("modo reserva" in m.lower() for m in enviadas), "deve avisar modo reserva"
-assert any("EMISSOR RESERVA" in m for m in enviadas)
-assert any("fonte de reserva" in m.lower() for m in enviadas)
-print(f"  Mensagens no modo reserva: {len(enviadas)} (1 aviso + alertas)")
-print("OK ✅ (fallback funciona e avisa o usuário)")
+def coletar_do_sre():
+    """
+    Coleta as ofertas de interesse via API do SRE. Devolve (lista_de_Oferta,
+    sessao). Lança exceção se a API principal estiver inacessível.
+    """
+    sess = _nova_sessao()
+    brutos = sre_listar_ofertas(sess, QTD_OFERTAS_VERIFICAR)
+    log.info("SRE: %d ofertas recebidas da API.", len(brutos))
+    limite_data = datetime.now() - timedelta(days=JANELA_DIAS)
+    ofertas = []
+    vistos = set()
+    for reg in brutos:
+        o = sre_registro_para_oferta(reg)
+        if not o.categorias:          # não é um tipo monitorado
+            continue
+        if o.fase is None:            # status terminal / sem status
+            continue
+        if o.data is not None and o.data < limite_data:
+            continue
+        ch = o.chave()
+        if ch in vistos:              # dedup (séries, repetições)
+            continue
+        vistos.add(ch)
+        ofertas.append(o)
+    return ofertas, sess
 
-print("\n##### TESTE 10: migração do estado antigo #####")
-bot.STATE_FILE.write_text(json.dumps({
-    "ids_notificados": ["proc:SRE/26300/2026"], "primeira_execucao": False
-}), encoding="utf-8")
-est = bot.carregar_estado()
-assert est["ofertas"] == {"proc:SRE/26300/2026": bot.FASE_REGISTRADA}
-print("  Estado antigo convertido. OK ✅")
 
-print("\n##### TESTE 11: formatação de valor #####")
-assert bot.formatar_valor("2.400.000.000,0000") == "R$ 2.400.000.000,00"
-assert bot.formatar_valor("0,0000") == ""
-assert bot.formatar_valor("") == ""
-print("OK ✅")
+# -------------------------------------------------------------------
+# FONTE DE RESERVA — Portal de Dados Abertos (.zip / CSV)
+# -------------------------------------------------------------------
+def coletar_do_fallback():
+    """
+    Coleta as ofertas do Portal de Dados Abertos (fonte estável, porém
+    defasada). Usada só quando a API do SRE falha. Devolve lista de Oferta.
+    """
+    import csv
+    log.warning("Usando a FONTE DE RESERVA (Portal de Dados Abertos).")
+    resp = requests.get(CVM_ZIP_URL, timeout=120,
+                         headers={"User-Agent": "cvm-robo/2.0"})
+    resp.raise_for_status()
+    limite_data = datetime.now() - timedelta(days=JANELA_DIAS)
+    ofertas = []
+    vistos = set()
 
-bot.STATE_FILE.unlink(missing_ok=True)
-if bot.LOG_FILE.exists():
-    bot.LOG_FILE.unlink()
-print("\n=========================================")
-print(" TODOS OS TESTES PASSARAM ✅")
-print("=========================================")
+    with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+        for nome in zf.namelist():
+            if not nome.lower().endswith(".csv"):
+                continue
+            with zf.open(nome) as fh:
+                texto = io.TextIOWrapper(fh, encoding="latin-1", newline="")
+                leitor = csv.DictReader(texto, delimiter=";")
+                for row in leitor:
+                    # detecção tolerante de colunas
+                    def pega(*nomes):
+                        for n in nomes:
+                            for k, v in row.items():
+                                if normalize(k).replace(" ", "") == normalize(n).replace(" ", ""):
+                                    return v
+                        return ""
+                    tipo = pega("Tipo_Ativo", "Valor_Mobiliario")
+                    cats = categorias_do_texto(tipo)
+                    if not cats:
+                        continue
+                    o = Oferta()
+                    o.fonte = "Dados Abertos (reserva)"
+                    o.tipo = str(tipo or "").strip()
+                    o.categorias = cats
+                    o.emissor = str(pega("Nome_Emissor") or "").strip()
+                    o.lider = str(pega("Nome_Lider") or "").strip()
+                    o.processo = str(pega("Numero_Processo") or "").strip()
+                    o.status = str(pega("Status_Requerimento") or "").strip()
+                    o.valor = str(pega("Valor_Total_Registrado", "Valor_Total") or "").strip()
+                    o.modalidade = str(pega("Tipo_Oferta", "Modalidade_Oferta") or "").strip()
+                    o.rito = str(pega("Rito_Requerimento", "Rito_Oferta") or "").strip()
+                    data_reg = pega("Data_Registro", "Data_Registro_Oferta")
+                    data_ent = pega("Data_requerimento", "Data_Protocolo")
+                    o.data = parse_data(data_reg) or parse_data(data_ent)
+                    if parse_data(data_reg):
+                        o.fase = FASE_REGISTRADA
+                    else:
+                        o.fase = fase_do_status(o.status) or FASE_ANALISE
+                    if o.data is not None and o.data < limite_data:
+                        continue
+                    ch = o.chave()
+                    if ch in vistos:
+                        continue
+                    vistos.add(ch)
+                    ofertas.append(o)
+    log.info("Fonte de reserva: %d ofertas de interesse na janela.", len(ofertas))
+    return ofertas
+
+
+# -------------------------------------------------------------------
+# Estado
+# -------------------------------------------------------------------
+def carregar_estado() -> dict:
+    if STATE_FILE.exists():
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as fh:
+                dados = json.load(fh)
+            if "ofertas" not in dados:
+                antigos = dados.get("ids_notificados", [])
+                dados["ofertas"] = {oid: FASE_REGISTRADA for oid in antigos}
+            dados.setdefault("ofertas", {})
+            return dados
+        except Exception as exc:  # noqa: BLE001
+            log.error("Estado corrompido (%s). Começando do zero.", exc)
+    return {"ofertas": {}, "primeira_execucao": True}
+
+
+def salvar_estado(estado: dict) -> None:
+    estado["atualizado_em"] = datetime.now().isoformat(timespec="seconds")
+    tmp = STATE_FILE.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(estado, fh, ensure_ascii=False, indent=2)
+    tmp.replace(STATE_FILE)
+
+
+# -------------------------------------------------------------------
+# Telegram
+# -------------------------------------------------------------------
+def enviar_telegram(texto: str) -> bool:
+    if (not TELEGRAM_BOT_TOKEN or "COLE_AQUI" in TELEGRAM_BOT_TOKEN
+            or not TELEGRAM_CHAT_ID or "COLE_AQUI" in TELEGRAM_CHAT_ID):
+        log.error("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID não configurados.")
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": texto,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    try:
+        resp = requests.post(url, data=payload, timeout=30)
+        if resp.status_code == 200 and resp.json().get("ok"):
+            return True
+        log.error("Telegram recusou a mensagem: %s %s",
+                  resp.status_code, resp.text[:300])
+        return False
+    except Exception as exc:  # noqa: BLE001
+        log.error("Erro ao falar com o Telegram: %s", exc)
+        return False
+
+
+def formatar_valor(bruto) -> str:
+    s = str(bruto or "").strip()
+    if not s or s.lower() in ("nan", "none", "null", "0", "0.0", "0,0", "0,0000"):
+        return ""
+    teste = s.replace("R$", "").strip()
+    if "," in teste and "." in teste:
+        teste = teste.replace(".", "").replace(",", ".")
+    elif "," in teste:
+        teste = teste.replace(",", ".")
+    try:
+        n = float(teste)
+        if n <= 0:
+            return ""
+        return "R$ " + f"{n:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    except ValueError:
+        return s
+
+
+def link_da_oferta(o: Oferta) -> str:
+    """Link direto para a página da oferta no SRE (quando há id)."""
+    if o.id:
+        return SRE_LINK_OFERTA.format(id=urllib.parse.quote(str(o.id)))
+    return SRE_BASE + "/#/consulta-oferta-publica"
+
+
+def formatar_mensagem(o: Oferta) -> str:
+    """Monta o texto (HTML) do alerta de uma oferta."""
+    if o.fase == FASE_REGISTRADA:
+        cabecalho = "✅ <b>Oferta registrada na CVM</b>"
+        rotulo_data = "Data"
+    else:
+        cabecalho = "📥 <b>Novo pedido de oferta em análise na CVM</b>"
+        rotulo_data = "Data"
+
+    linhas = [
+        cabecalho,
+        "",
+        f"📄 <b>Tipo:</b> {html_escape(o.tipo or '(não informado)')}",
+        f"🏢 <b>Emissor:</b> {html_escape(o.emissor or '(não informado)')}",
+    ]
+    # Devedor (risco) só em CRA/CRI.
+    if o.eh_cri_cra() and o.devedor:
+        dev = o.devedor
+        if len(dev) > 500:           # textos muito longos: corta com reticências
+            dev = dev[:500].rstrip() + "…"
+        linhas.append(f"🎯 <b>Devedor (risco):</b> {html_escape(dev)}")
+    if o.lider:
+        linhas.append(f"🏦 <b>Coordenador líder:</b> {html_escape(o.lider)}")
+    if o.coordenadores:
+        lista = ", ".join(o.coordenadores)
+        if len(lista) > 400:             # muitos coordenadores: corta
+            lista = lista[:400].rstrip() + "…"
+        linhas.append(f"🤝 <b>Demais coordenadores:</b> {html_escape(lista)}")
+    if o.data:
+        linhas.append(f"📅 <b>{rotulo_data}:</b> {o.data.strftime('%d/%m/%Y')}")
+    valor_txt = formatar_valor(o.valor)
+    if valor_txt:
+        linhas.append(f"💰 <b>Valor:</b> {valor_txt}")
+    if o.rito:
+        linhas.append(f"📊 <b>Rito:</b> {html_escape(o.rito)}")
+    if o.modalidade:
+        linhas.append(f"📋 <b>Modalidade:</b> {html_escape(o.modalidade)}")
+    if o.status:
+        linhas.append(f"📌 <b>Situação:</b> {html_escape(o.status)}")
+    if o.protocolo:
+        linhas.append(f"🔢 <b>Protocolo:</b> {html_escape(o.protocolo)}")
+    if o.processo:
+        linhas.append(f"🗂️ <b>Processo:</b> {html_escape(o.processo)}")
+    if o.fonte != "SRE":
+        linhas.append(f"\n⚠️ <i>Dado da fonte de reserva ({html_escape(o.fonte)}) "
+                      f"— pode estar defasado.</i>")
+    linhas += ["", f'🔗 <a href="{link_da_oferta(o)}">Abrir a oferta no SRE</a>']
+    return "\n".join(linhas)
+
+
+# -------------------------------------------------------------------
+# Núcleo: uma verificação
+# -------------------------------------------------------------------
+def coletar_ofertas():
+    """
+    Tenta a fonte principal (SRE). Se falhar, cai para a reserva.
+    Devolve (lista_de_Oferta, sessao_ou_None, usou_reserva: bool).
+    """
+    try:
+        ofertas, sess = coletar_do_sre()
+        return ofertas, sess, False
+    except Exception as exc:  # noqa: BLE001
+        log.error("Fonte principal (SRE) falhou: %s", exc)
+        try:
+            ofertas = coletar_do_fallback()
+            return ofertas, None, True
+        except Exception as exc2:  # noqa: BLE001
+            log.error("Fonte de reserva também falhou: %s", exc2)
+            return [], None, False
+
+
+def verificar(dry_run: bool = False, notificar_primeira: bool = False) -> None:
+    estado = carregar_estado()
+    primeira = estado.get("primeira_execucao", False) or not STATE_FILE.exists()
+    ofertas_estado = dict(estado.get("ofertas", {}))
+
+    ofertas, sess, usou_reserva = coletar_ofertas()
+    if not ofertas:
+        log.error("Nenhuma oferta coletada (ambas as fontes falharam?). "
+                  "Encerrando sem alterar o estado.")
+        return
+
+    n_analise = sum(1 for o in ofertas if o.fase == FASE_ANALISE)
+    n_reg = sum(1 for o in ofertas if o.fase == FASE_REGISTRADA)
+    log.info("Ofertas de interesse na janela: %d (%d em análise, %d registradas)%s",
+             len(ofertas), n_analise, n_reg,
+             "  [FONTE DE RESERVA]" if usou_reserva else "")
+
+    # Primeira execução: semeia o estado sem notificar.
+    if primeira and not notificar_primeira:
+        for o in ofertas:
+            ofertas_estado[o.chave()] = o.fase
+        estado["ofertas"] = ofertas_estado
+        estado["primeira_execucao"] = False
+        if not dry_run:
+            salvar_estado(estado)
+        log.info("Primeira execução: %d ofertas semeadas no estado SEM "
+                 "notificar.", len(ofertas))
+        return
+
+    # Detecta novidades e mudanças de fase.
+    eventos = []
+    for o in ofertas:
+        ch = o.chave()
+        fase_anterior = ofertas_estado.get(ch)
+        if fase_anterior == o.fase:
+            continue
+        if o.fase == FASE_ANALISE and fase_anterior == FASE_REGISTRADA:
+            continue                      # não regride
+        eventos.append(o)
+
+    if not eventos:
+        log.info("Nenhuma novidade desta vez.")
+        if not dry_run:
+            estado["ofertas"] = ofertas_estado
+            estado["primeira_execucao"] = False
+            salvar_estado(estado)
+        return
+
+    log.info("%d novidade(s) encontrada(s).", len(eventos))
+
+    # Para as ofertas novas vindas do SRE, busca os detalhes extras:
+    #  - coordenadores do consórcio (todas as ofertas);
+    #  - devedor (só CRA/CRI, onde faz sentido).
+    if sess is not None:
+        for o in eventos:
+            if not o.id:
+                continue
+            o.coordenadores = sre_coordenadores(sess, o.id, o.lider)
+            time.sleep(0.3)
+            if o.eh_cri_cra():
+                o.devedor = sre_detalhe_devedor(sess, o.id)
+                time.sleep(0.3)
+
+    # Aviso único de modo reserva (no máximo uma vez por verificação).
+    if usou_reserva and not dry_run:
+        enviar_telegram(
+            "⚠️ <b>Robô CVM em modo reserva</b>\n\n"
+            "A fonte principal (API do SRE) não respondeu nesta verificação. "
+            "Os alertas a seguir vêm do Portal de Dados Abertos, que é oficial "
+            "mas pode estar defasado em alguns dias. Se isso persistir, a API "
+            "do SRE pode ter mudado e o robô precisa de revisão.")
+
+    enviadas = 0
+    for o in eventos:
+        msg = formatar_mensagem(o)
+        if dry_run:
+            print(f"\n----- (DRY-RUN) [{o.fase}] {o.fonte} -----")
+            print(msg)
+            print("-" * 40)
+            ofertas_estado[o.chave()] = o.fase
+            enviadas += 1
+            continue
+        if enviar_telegram(msg):
+            ofertas_estado[o.chave()] = o.fase
+            enviadas += 1
+            log.info("Alerta enviado [%s]: %s", o.fase, o.chave())
+            time.sleep(1)
+        else:
+            log.warning("Falha ao enviar (será tentado de novo): %s", o.chave())
+
+    estado["ofertas"] = ofertas_estado
+    estado["primeira_execucao"] = False
+    if not dry_run:
+        salvar_estado(estado)
+    log.info("Verificação concluída: %d/%d alertas enviados.", enviadas, len(eventos))
+
+
+# -------------------------------------------------------------------
+# Modos auxiliares
+# -------------------------------------------------------------------
+def modo_inspect() -> None:
+    """Consulta a API do SRE e mostra o que o robô está enxergando."""
+    print("=" * 66)
+    print("INSPEÇÃO — fonte principal: API do SRE")
+    print("=" * 66)
+    try:
+        sess = _nova_sessao()
+        brutos = sre_listar_ofertas(sess, QTD_OFERTAS_VERIFICAR)
+    except Exception as exc:  # noqa: BLE001
+        print(f"❌ A API do SRE falhou: {exc}")
+        print("Tentando a fonte de reserva...")
+        try:
+            ofertas = coletar_do_fallback()
+            print(f"Fonte de reserva OK: {len(ofertas)} ofertas de interesse.")
+        except Exception as exc2:  # noqa: BLE001
+            print(f"❌ Fonte de reserva também falhou: {exc2}")
+        return
+
+    print(f"API respondeu. {len(brutos)} ofertas recebidas.\n")
+    if brutos:
+        print("Campos disponíveis em cada registro da listagem:")
+        for k in brutos[0].keys():
+            print(f"   - {k}")
+
+    # estatísticas
+    limite_data = datetime.now() - timedelta(days=JANELA_DIAS)
+    cont_total = Counter()
+    cont_analise = Counter()
+    cont_reg = Counter()
+    status_vistos = Counter()
+    exemplos = {}
+    for reg in brutos:
+        o = sre_registro_para_oferta(reg)
+        status_vistos[o.status] += 1
+        if not o.categorias:
+            continue
+        na_janela = o.data is not None and o.data >= limite_data
+        for c in o.categorias:
+            cont_total[c] += 1
+            if o.fase == FASE_ANALISE and na_janela:
+                cont_analise[c] += 1
+                exemplos.setdefault((c, FASE_ANALISE), o)
+            elif o.fase == FASE_REGISTRADA and na_janela:
+                cont_reg[c] += 1
+                exemplos.setdefault((c, FASE_REGISTRADA), o)
+
+    print(f"\nValores de status encontrados:")
+    for st, qtd in status_vistos.most_common(20):
+        print(f"   {qtd:>5}  {st!r}")
+
+    print(f"\nOfertas por tipo monitorado "
+          f"(total | em análise na janela | registradas na janela):")
+    for c in PADROES_TIPO:
+        print(f"   {c}")
+        print(f"      total: {cont_total[c]:>5}  |  análise: {cont_analise[c]:>4}"
+              f"  |  registradas: {cont_reg[c]:>4}")
+
+    # exemplo de mensagem (busca detalhes extras de um exemplo de cada tipo)
+    print("\nExemplos de mensagem:")
+    algum = False
+    for c in PADROES_TIPO:
+        for fase in (FASE_ANALISE, FASE_REGISTRADA):
+            o = exemplos.get((c, fase))
+            if o is None:
+                continue
+            algum = True
+            if o.id:
+                o.coordenadores = sre_coordenadores(sess, o.id, o.lider)
+                if o.eh_cri_cra():
+                    o.devedor = sre_detalhe_devedor(sess, o.id)
+            print("\n" + "- " * 27)
+            print(formatar_mensagem(o))
+    if not algum:
+        print("   (nenhuma oferta na janela agora)")
+
+
+def modo_test_telegram() -> None:
+    msg = ("✅ <b>Robô CVM → Telegram</b>\n\n"
+           "Teste de conexão bem-sucedido. Você receberá um alerta aqui "
+           "quando um pedido de oferta de CRA, CRI, debênture ou nota "
+           "comercial entrar em análise — e outro quando for registrada.")
+    if enviar_telegram(msg):
+        log.info("Mensagem de teste enviada com sucesso. ✅")
+    else:
+        log.error("Falha ao enviar a mensagem de teste. Confira os Secrets.")
+
+
+# -------------------------------------------------------------------
+# main
+# -------------------------------------------------------------------
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Robô que avisa no Telegram sobre ofertas (CRA, CRI, "
+                    "debêntures, notas comerciais) na CVM, via API do SRE.")
+    parser.add_argument("--loop", action="store_true",
+                        help=f"roda continuamente, a cada {POLL_INTERVAL_SECONDS}s")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="verifica e imprime as mensagens em vez de enviar")
+    parser.add_argument("--inspect", action="store_true",
+                        help="consulta a API e mostra o que o robô enxerga")
+    parser.add_argument("--test-telegram", action="store_true",
+                        help="envia uma mensagem de teste para o Telegram")
+    parser.add_argument("--notify-on-first-run", action="store_true",
+                        help="na primeira execução, notifica tudo da janela")
+    args = parser.parse_args()
+
+    if args.inspect:
+        modo_inspect()
+        return
+    if args.test_telegram:
+        modo_test_telegram()
+        return
+
+    if args.loop:
+        log.info("Modo loop iniciado (intervalo: %ds).", POLL_INTERVAL_SECONDS)
+        while True:
+            try:
+                verificar(dry_run=args.dry_run,
+                          notificar_primeira=args.notify_on_first_run)
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Erro inesperado na verificação: %s", exc)
+            try:
+                time.sleep(POLL_INTERVAL_SECONDS)
+            except KeyboardInterrupt:
+                log.info("Encerrado pelo usuário.")
+                break
+    else:
+        verificar(dry_run=args.dry_run,
+                  notificar_primeira=args.notify_on_first_run)
+
+
+if __name__ == "__main__":
+    main()
