@@ -3,7 +3,7 @@
 # Este arquivo PRECISA ficar no caminho:  .github/workflows/cvm-robo.yml
 #
 # O que ele faz:
-#  - dispara o robô de hora em hora (agendamento cron, em UTC);
+#  - dispara o robô a cada 30 min em dias úteis e a cada 3h nos fins de semana;
 #  - também pode ser disparado manualmente pelo botão "Run workflow"
 #    (com opção de só testar o Telegram ou inspecionar os dados);
 #  - usa o cache do Actions para preservar o arquivo estado_ofertas.json
@@ -13,11 +13,27 @@ name: Robô CVM → Telegram
 
 on:
   schedule:
-    # 'minuto hora dia mês dia-da-semana' — sempre em UTC.
-    # '0 * * * *' = no minuto 0 de toda hora. Como o robô roda de hora em
-    # hora, o fuso não importa. Para verificar com menos frequência, troque
-    # por algo como '0 */3 * * *' (a cada 3 horas).
-    - cron: '0 * * * *'
+    # IMPORTANTE: o cron do GitHub Actions é sempre em UTC. O Brasil é UTC-3.
+    # Os dias-da-semana abaixo (campo final do cron) também são em UTC, então
+    # foram escolhidos para que o resultado, no horário do Brasil, seja:
+    #   - segunda a sexta: uma verificação a cada 30 minutos;
+    #   - sábado e domingo: uma verificação a cada 3 horas.
+    #
+    # Como UTC está 3h à frente, o "dia útil brasileiro" das 00h às 21h
+    # corresponde a segunda-a-sexta em UTC; as 21h-24h do Brasil já são o
+    # dia seguinte em UTC. Para manter simples e robusto, usamos:
+    #
+    # Dias úteis (a cada 30 min) — seg a sex em UTC, dia inteiro:
+    - cron: '*/30 * * * 1-5'
+    # Fim de semana (a cada 3 horas) — sáb e dom em UTC:
+    - cron: '0 */3 * * 0,6'
+    #
+    # Observação prática: por causa da diferença de fuso, nas faixas de
+    # virada (sex à noite / dom à noite, horário do Brasil) a frequência
+    # pode trocar algumas horas antes/depois do "ponto exato". Isso é
+    # inofensivo para o robô — no pior caso ele verifica um pouco mais
+    # ou um pouco menos. Se quiser precisão total no fuso do Brasil,
+    # dá para detalhar mais os crons; para este uso, esta versão basta.
 
   # Permite rodar na mão pela aba "Actions" do GitHub (útil para testar).
   workflow_dispatch:
