@@ -10,75 +10,85 @@ Ofertas dos tipos:
 
 - **CRA** — Certificado de Recebíveis do Agronegócio
 - **CRI** — Certificado de Recebíveis Imobiliários
-- **Debêntures** (incluindo debêntures simples)
+- **Debêntures**
 - **Notas Comerciais** (e Notas Promissórias Comerciais)
 
 E acompanha o **ciclo de vida** de cada oferta — pode enviar **dois alertas**:
 
 - 📥 **Novo pedido em análise** — quando o pedido entra na CVM;
-- ✅ **Oferta registrada** — quando o registro é concedido (ou dispensado).
+- ✅ **Oferta registrada** — quando o registro é concedido.
 
 Quem só quiser os alertas de registro pode mudar `ALERTAR_EM_ANALISE` para
 `False` no topo do `cvm_telegram_bot.py`.
 
-## Como é a mensagem
+## O que vem em cada alerta
 
-Cada alerta traz:
-
-- **Tipo** da oferta (lido da coluna oficial da CVM)
+- **Tipo** da oferta
 - **Emissor**
 - **Devedor (risco)** — *só em CRA e CRI*, onde o emissor é a securitizadora
-  e o risco real é do devedor lastro
-- **Coordenador líder** e **categoria do coordenador**
-- **Data** (de entrada, se em análise; de registro, se registrada)
-- **Valor** (quando informado)
-- **Rito**, **modalidade**, **público-alvo** e **situação**
-- **Número de registro/requerimento** e **número do processo**
-- 🔗 **Link de busca no Google** pelo número de processo, que costuma cair
-  direto na página da oferta (anúncio de início, prospecto, ou tela do SRE)
+  e o risco de crédito real é do devedor lastro
+- **Coordenador líder** e **demais coordenadores do consórcio**
+- **Data**, **valor**, **rito**, **modalidade** e **situação**
+- **Protocolo** e **número do processo**
+- 🔗 **Link direto** para a página da oferta no sistema SRE
 
----
+-----
 
 ## Como funciona
 
 A cada execução, o robô:
 
-1. Baixa o arquivo oficial de ofertas do **Portal de Dados Abertos da CVM**
-   (`oferta_distribuicao.zip`), mantido pela própria SRE.
-2. Lê os dois CSVs do zip (`oferta_distribuicao.csv` e `oferta_resolucao_160.csv`),
-   detectando as colunas automaticamente.
-3. Filtra pelas ofertas dos tipos monitorados e classifica cada uma em uma
-   **fase** (em análise / registrada / ignorar).
-4. Compara com o que já foi notificado antes (arquivo `estado_ofertas.json`).
-5. Envia um alerta quando uma oferta **aparece** ou **muda de fase**.
+1. Consulta a **API do sistema SRE** (a mesma que alimenta a tela pública de
+   consulta de ofertas), pedindo as ofertas mais recentes, ordenadas por data.
+1. Filtra pelos tipos monitorados e classifica cada oferta em uma **fase**
+   (em análise / registrada / ignorar), a partir do status.
+1. Para cada oferta **nova**, busca os detalhes extras: os coordenadores do
+   consórcio e, em CRA/CRI, o devedor.
+1. Compara com o que já foi notificado antes (arquivo `estado_ofertas.json`).
+1. Envia um alerta no canal do Telegram quando uma oferta **aparece** ou
+   **muda de fase**.
 
-### Sobre a fonte de dados
+### Fonte de dados — principal: API do SRE
 
-O sistema web do SRE (`web.cvm.gov.br/sre-publico-cvm`) mostra os dados quase
-em tempo real, mas usa uma API interna **não documentada e instável** — não é
-confiável para automação de longo prazo.
+O robô consome a API interna do sistema SRE
+(`web.cvm.gov.br/sre-publico-cvm`). Vantagem: os dados são atualizados em
+tempo quase real — sem a defasagem de dias do Portal de Dados Abertos.
 
-Este robô usa o **Portal de Dados Abertos** (`dados.cvm.gov.br`), que é a fonte
-**oficial, pública e estável** com exatamente as mesmas ofertas. O arquivo é
-atualizado pela CVM **diariamente** (às vezes mais de uma vez por dia). Na
-prática: você recebe o alerta com algumas horas de defasagem em vez de
-segundos — o que é adequado para acompanhar o pipeline de ofertas.
+Endpoints usados:
+
+- `POST .../rest/sitePublico/pesquisar/detalhado` — lista paginada de ofertas.
+- `GET  .../rest/sitePublico/pesquisar/infOferta/{id}` — detalhe da oferta
+  (de onde sai o devedor).
+- `GET  .../rest/sitePublico/pesquisar/participantes/{id}` — participantes
+  da oferta (de onde saem os coordenadores do consórcio).
+
+**Atenção:** esta API é interna do site da CVM, não é documentada nem tem
+contrato público de estabilidade. Pode mudar de formato sem aviso. Por isso
+existe uma fonte de reserva (abaixo).
+
+### Fonte de dados — reserva (fallback)
+
+Se a API do SRE falhar (timeout, bloqueio, formato inesperado), o robô
+automaticamente tenta o **Portal de Dados Abertos da CVM** (arquivo .zip,
+fonte oficial e estável, porém defasada em alguns dias). Nesse caso ele
+envia um aviso de “modo reserva” no Telegram, para você saber que os dados
+podem estar atrasados e que a fonte principal precisa de atenção.
 
 ### Robustez
 
-- **Detecta as colunas automaticamente.** A CVM já mudou nomes de colunas no
-  passado. O robô usa correspondência por palavra-chave, então sobrevive a
-  pequenas alterações.
-- **Deduplica entre arquivos e séries.** A mesma oferta pode aparecer em mais
-  de uma linha (várias séries) ou nos dois CSVs — o robô notifica uma vez só.
+- **Comparação de estado.** A cada execução o robô re-verifica as ofertas
+  recentes e compara com o estado salvo. Uma oferta que escape numa execução
+  é capturada na seguinte — não há “perdeu o bonde”.
+- **Deduplicação.** A mesma oferta não gera alertas repetidos, nem quando
+  aparece mais de uma vez na listagem.
 - **Filtro por status.** Pedidos cancelados, revogados, expirados, caducados
-  etc. são ignorados (não viram alerta nem ficam pendurados aguardando).
-- **Filtro por janela temporal.** Só considera ofertas com data dentro dos
-  últimos 45 dias (configurável) — evita re-notificar histórico antigo.
+  etc. são ignorados.
+- **Filtro por janela temporal.** Só considera ofertas dos últimos 45 dias
+  (configurável) — evita re-notificar histórico antigo.
 - **Estado persistente.** Cada execução só envia o que mudou desde a última;
-  o estado fica em cache, sobrevive entre execuções.
+  o estado fica no cache do GitHub Actions, sobrevivendo entre execuções.
 
----
+-----
 
 ## Estrutura do projeto
 
@@ -86,57 +96,49 @@ segundos — o que é adequado para acompanhar o pipeline de ofertas.
 .
 ├── cvm_telegram_bot.py            # o robô (é o que importa)
 ├── requirements.txt               # dependências
-├── test_motor.py                  # testes (opcional, só local)
+├── test_motor.py                  # testes (opcional, só para rodar localmente)
 ├── README.md                      # este arquivo
 ├── RODAR_NO_GITHUB_ACTIONS.md     # guia completo de setup
 └── .github/workflows/cvm-robo.yml # agendamento e execução automatizada
 ```
 
----
+-----
 
-## Setup rápido
+## Agendamento
 
-Em alto nível, o setup é:
+O robô roda automaticamente pelo GitHub Actions:
 
-1. **Criar um bot no Telegram** com o `@BotFather` → guardar o token.
-2. **Criar um canal do Telegram** (privado) → adicionar o bot **como
-   administrador** → obter o `chat_id` do canal.
-3. **Subir os arquivos** num repositório do GitHub.
-4. **Cadastrar dois secrets** no repositório:
-   - `TELEGRAM_BOT_TOKEN`
-   - `TELEGRAM_CHAT_ID`
-5. **Disparar** uma vez na aba Actions (modo `testar-telegram`) para validar,
-   depois (modo `verificar`) para semear o estado inicial sem disparar
-   alertas de histórico.
+- **Dias úteis:** uma verificação a cada **30 minutos**.
+- **Fins de semana:** uma verificação a cada **3 horas**.
 
-O passo a passo detalhado, com cliques na interface do GitHub e tudo, está
-em **`RODAR_NO_GITHUB_ACTIONS.md`**.
+O agendamento é definido pelos `cron` no arquivo `.github/workflows/cvm-robo.yml`.
+Os horários do cron são em UTC (Brasil = UTC−3).
 
----
+-----
 
 ## Modos de execução
 
 Da aba **Actions** do repositório, **Run workflow** → escolha um modo:
 
-| Modo | Para quê |
-|---|---|
-| `verificar` | Verificação normal — é o que o agendamento usa. Envia alertas das ofertas novas. |
-| `testar-telegram` | Manda só uma mensagem de teste, para validar token e chat_id. |
-| `inspecionar` | Baixa os dados e analisa a estrutura dos CSVs no log. Útil pra diagnóstico se algo parar de funcionar. |
+|Modo             |Para quê                                                                                                                             |
+|-----------------|-------------------------------------------------------------------------------------------------------------------------------------|
+|`verificar`      |Verificação normal — é o que o agendamento usa. Envia alertas das ofertas novas.                                                     |
+|`testar-telegram`|Manda só uma mensagem de teste, para validar token e chat_id.                                                                        |
+|`inspecionar`    |Consulta a API e mostra no log o que o robô está enxergando (status, contagem por tipo, exemplos de mensagem). Útil para diagnóstico.|
 
-Também dá pra rodar localmente (para testes), com:
+Também é possível rodar localmente, para testes:
 
 ```bash
 pip install -r requirements.txt
 export TELEGRAM_BOT_TOKEN="..."
 export TELEGRAM_CHAT_ID="..."
-python cvm_telegram_bot.py --inspect        # analisa a estrutura do CSV
+python cvm_telegram_bot.py --inspect        # mostra o que o robô enxerga
 python cvm_telegram_bot.py --test-telegram  # envia uma mensagem de teste
 python cvm_telegram_bot.py --dry-run        # verifica mas imprime em vez de enviar
 python cvm_telegram_bot.py                  # uma verificação real
 ```
 
----
+-----
 
 ## Configurações no topo do `cvm_telegram_bot.py`
 
@@ -146,27 +148,29 @@ Tudo no bloco **CONFIGURAÇÃO**:
   exemplo, deixe apenas a entrada do CRI no dicionário.
 - **`ALERTAR_EM_ANALISE`** — `True` (padrão) ou `False`. Se `False`, o robô
   só envia o alerta ✅ de registro.
-- **`STATUS_TERMINAIS`** — palavras que indicam pedido encerrado sem registro
-  (cancelado, expirado, revogado etc.). Esses são ignorados.
-- **`JANELA_DIAS`** — quantos dias para trás contam como "recente" (padrão: 45).
-- **`POLL_INTERVAL_SECONDS`** — frequência do modo `--loop` (irrelevante no
-  GitHub Actions, que controla o agendamento pelo arquivo de workflow).
+- **`STATUS_TERMINAIS`** / **`STATUS_REGISTRADA`** — palavras usadas para
+  classificar a fase a partir do status da oferta.
+- **`JANELA_DIAS`** — quantos dias para trás contam como “recente” (padrão: 45).
+- **`QTD_OFERTAS_VERIFICAR`** — quantas ofertas recentes buscar por verificação
+  (padrão: 200). Aumente se o robô ficar muito tempo parado.
 
----
+-----
 
 ## Manutenção
 
 - **O cache do GitHub Actions guarda o estado** (`estado_ofertas.json`) entre
-  execuções. Não apague — apagar faz o robô tratar tudo como "primeira
-  execução" de novo (semeia sem notificar). Em geral, deixa quieto.
+  execuções. Não apague — apagar faz o robô tratar tudo como “primeira
+  execução” (semeia sem notificar). Em uso normal, deixe quieto.
 - **Se passar 60 dias sem nenhum commit no repositório**, o GitHub pausa o
-  agendamento e avisa por e-mail. Pra reativar, basta voltar na aba Actions
-  e reabilitar; ou fazer qualquer commit ocasional.
-- **Se os alertas pararem de chegar e você quiser investigar**, rode o modo
-  `inspecionar` — ele mostra no log o que o robô está vendo na CVM (linhas
-  lidas, colunas detectadas, contagem por tipo, exemplos de mensagem).
+  agendamento automático e avisa por e-mail. Para reativar, vá em Actions e
+  reabilite, ou faça qualquer commit.
+- **Se chegar um aviso de “modo reserva” no canal**, é sinal de que a API do
+  SRE não respondeu — provavelmente mudou de formato e o robô precisa de
+  revisão.
+- **Para diagnóstico**, rode o modo `inspecionar`: ele mostra no log se a API
+  respondeu, os status encontrados, a contagem por tipo e exemplos de mensagem.
 
----
+-----
 
 ## Aviso
 
