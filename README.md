@@ -66,13 +66,19 @@ Endpoints usados:
 contrato público de estabilidade. Pode mudar de formato sem aviso. Por isso
 existe uma fonte de reserva (abaixo).
 
-### Fonte de dados — reserva (fallback)
+### Modo reserva (degradado)
 
 Se a API do SRE falhar (timeout, bloqueio, formato inesperado), o robô
-automaticamente tenta o **Portal de Dados Abertos da CVM** (arquivo .zip,
-fonte oficial e estável, porém defasada em alguns dias). Nesse caso ele
-envia um aviso de “modo reserva” no Telegram, para você saber que os dados
-podem estar atrasados e que a fonte principal precisa de atenção.
+**não dispara alertas individuais** — ele envia, no máximo uma vez a cada
+12 horas, um aviso de “modo reserva” no Telegram, só pra você saber que
+está degradado. Quando o SRE voltar, as ofertas reais surgidas no período
+são capturadas normalmente na próxima verificação via SRE.
+
+**Por que não usar o Portal de Dados Abertos como reserva ativa?** Porque
+o Portal contém o histórico inteiro de ofertas e usa identificadores
+diferentes dos do SRE — comparar com o estado salvo gera milhares de
+falsos positivos (flood). Ainda dá pra inspecioná-lo manualmente via
+`--inspect`, mas o `verificar` não o usa para alertar.
 
 ### Robustez
 
@@ -165,8 +171,10 @@ Tudo no bloco **CONFIGURAÇÃO**:
   agendamento automático e avisa por e-mail. Para reativar, vá em Actions e
   reabilite, ou faça qualquer commit.
 - **Se chegar um aviso de “modo reserva” no canal**, é sinal de que a API do
-  SRE não respondeu — provavelmente mudou de formato e o robô precisa de
-  revisão.
+  SRE não respondeu. Os alertas individuais ficam suspensos nesse intervalo
+  pra evitar flood. O aviso é repetido no máximo a cada 12h; se persistir
+  por mais de algumas horas, a API do SRE pode ter mudado e o robô precisa
+  de revisão (rode `inspecionar` para diagnosticar).
 - **Para diagnóstico**, rode o modo `inspecionar`: ele mostra no log se a API
   respondeu, os status encontrados, a contagem por tipo e exemplos de mensagem.
 

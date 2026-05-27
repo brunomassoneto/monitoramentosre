@@ -32,13 +32,18 @@ tem contrato público de estabilidade. Pode mudar de formato ou passar a
 bloquear acesso automatizado sem aviso. Por isso o robô tem uma FONTE DE
 RESERVA (ver abaixo).
 
-Fonte de dados — reserva (fallback)
------------------------------------
-Se a API do SRE falhar (timeout, bloqueio, formato inesperado), o robô tenta
-o Portal de Dados Abertos da CVM (arquivo .zip, fonte oficial e estável, mas
-defasada). Nesse caso ele envia um aviso de "modo reserva" no Telegram, para
-você saber que os dados podem estar atrasados e que a fonte principal
-precisa de atenção.
+Modo reserva (degradado)
+------------------------
+Se a API do SRE falhar (timeout, bloqueio, formato inesperado), o robô NÃO
+dispara alertas individuais. Ele envia, no máximo uma vez a cada 12 horas,
+um aviso de "modo reserva" no Telegram — só para você saber que está
+degradado. Quando o SRE voltar, as ofertas reais surgidas nesse período
+são capturadas normalmente na próxima verificação via SRE.
+
+(O motivo: o Portal de Dados Abertos da CVM contém o histórico inteiro e
+usa identificadores diferentes dos do SRE; comparar com o estado salvo
+gera milhares de falsos positivos. Ainda é possível inspecioná-lo via
+--inspect para diagnóstico.)
 
 Como usar
 ---------
@@ -662,42 +667,71 @@ def formatar_mensagem(o: Oferta) -> str:
 # -------------------------------------------------------------------
 # Núcleo: uma verificação
 # -------------------------------------------------------------------
-def coletar_ofertas():
-    """
-    Tenta a fonte principal (SRE). Se falhar, cai para a reserva.
-    Devolve (lista_de_Oferta, sessao_ou_None, usou_reserva: bool).
-    """
-    try:
-        ofertas, sess = coletar_do_sre()
-        return ofertas, sess, False
-    except Exception as exc:  # noqa: BLE001
-        log.error("Fonte principal (SRE) falhou: %s", exc)
-        try:
-            ofertas = coletar_do_fallback()
-            return ofertas, None, True
-        except Exception as exc2:  # noqa: BLE001
-            log.error("Fonte de reserva também falhou: %s", exc2)
-            return [], None, False
-
-
 def verificar(dry_run: bool = False, notificar_primeira: bool = False) -> None:
     estado = carregar_estado()
     primeira = estado.get("primeira_execucao", False) or not STATE_FILE.exists()
     ofertas_estado = dict(estado.get("ofertas", {}))
 
-    ofertas, sess, usou_reserva = coletar_ofertas()
-    if not ofertas:
-        log.error("Nenhuma oferta coletada (ambas as fontes falharam?). "
-                  "Encerrando sem alterar o estado.")
-        return
+    # Tenta SRE direto. Se falhar, vai para modo reserva (sem chamar o
+    # fallback do Portal de Dados Abertos: a comparação seria inviável por
+    # causa dos identificadores diferentes — ver bloco abaixo).
+    try:
+        ofertas, sess = coletar_do_sre()
+        usou_reserva = False
+    except Exception as exc:  # noqa: BLE001
+        log.error("Fonte principal (SRE) falhou: %s", exc)
+        ofertas, sess, usou_reserva = [], None, True
 
     n_analise = sum(1 for o in ofertas if o.fase == FASE_ANALISE)
     n_reg = sum(1 for o in ofertas if o.fase == FASE_REGISTRADA)
-    log.info("Ofertas de interesse na janela: %d (%d em análise, %d registradas)%s",
-             len(ofertas), n_analise, n_reg,
-             "  [FONTE DE RESERVA]" if usou_reserva else "")
+    if not usou_reserva:
+        log.info("Ofertas de interesse na janela: %d (%d em análise, %d "
+                 "registradas)", len(ofertas), n_analise, n_reg)
 
-    # Primeira execução: semeia o estado sem notificar.
+    # MODO RESERVA: a fonte de reserva (Portal de Dados Abertos) contém o
+    # histórico inteiro e usa identificadores diferentes dos do SRE — então
+    # comparar com o estado salvo gera milhares de falsos positivos. Para
+    # evitar o flood, quando estamos no modo reserva NÃO disparamos alertas
+    # individuais e NÃO alteramos o estado. Mandamos no máximo um aviso a
+    # cada 12 horas para você saber que o robô está degradado. Quando a API
+    # do SRE voltar, as ofertas reais que apareceram nesse intervalo são
+    # capturadas naturalmente pela próxima verificação via SRE.
+    if usou_reserva:
+        ultimo_aviso = estado.get("ultimo_aviso_reserva")
+        agora = datetime.now()
+        precisa_avisar = True
+        if ultimo_aviso:
+            try:
+                ts = datetime.fromisoformat(ultimo_aviso)
+                if (agora - ts) < timedelta(hours=12):
+                    precisa_avisar = False
+            except ValueError:
+                pass
+        if precisa_avisar:
+            msg_reserva = (
+                "⚠️ <b>Robô CVM em modo reserva</b>\n\n"
+                "A fonte principal (API do SRE) não respondeu. O robô está "
+                "operando em modo degradado: <b>alertas individuais foram "
+                "suspensos</b> nesta janela para evitar flood (a fonte de "
+                "reserva traz o histórico inteiro, sem identificadores "
+                "estáveis).\n\n"
+                "Assim que a API do SRE voltar a responder, as ofertas reais "
+                "do período são notificadas normalmente. Se este aviso "
+                "persistir por mais de algumas horas, a API do SRE pode ter "
+                "mudado e o robô precisa de revisão.")
+            if dry_run:
+                print("\n----- (DRY-RUN) [aviso modo reserva] -----")
+                print(msg_reserva)
+                print("-" * 40)
+            else:
+                if enviar_telegram(msg_reserva):
+                    estado["ultimo_aviso_reserva"] = agora.isoformat(timespec="seconds")
+                    # Não mexemos em ofertas_estado nem em primeira_execucao.
+                    salvar_estado(estado)
+        log.info("Modo reserva ativo: alertas suspensos; estado preservado.")
+        return
+
+    # Primeira execução (só pela fonte principal): semeia o estado sem notificar.
     if primeira and not notificar_primeira:
         for o in ofertas:
             ofertas_estado[o.chave()] = o.fase
@@ -742,15 +776,6 @@ def verificar(dry_run: bool = False, notificar_primeira: bool = False) -> None:
             if o.eh_cri_cra():
                 o.devedor = sre_detalhe_devedor(sess, o.id)
                 time.sleep(0.3)
-
-    # Aviso único de modo reserva (no máximo uma vez por verificação).
-    if usou_reserva and not dry_run:
-        enviar_telegram(
-            "⚠️ <b>Robô CVM em modo reserva</b>\n\n"
-            "A fonte principal (API do SRE) não respondeu nesta verificação. "
-            "Os alertas a seguir vêm do Portal de Dados Abertos, que é oficial "
-            "mas pode estar defasado em alguns dias. Se isso persistir, a API "
-            "do SRE pode ter mudado e o robô precisa de revisão.")
 
     enviadas = 0
     for o in eventos:
