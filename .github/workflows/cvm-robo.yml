@@ -23,10 +23,16 @@ on:
     # corresponde a segunda-a-sexta em UTC; as 21h-24h do Brasil já são o
     # dia seguinte em UTC. Para manter simples e robusto, usamos:
     #
-    # Dias úteis (a cada 30 min) — seg a sex em UTC, dia inteiro:
-    - cron: '*/30 * * * 1-5'
-    # Fim de semana (a cada 3 horas) — sáb e dom em UTC:
-    - cron: '0 */3 * * 0,6'
+    # IMPORTANTE: NÃO usamos os minutos :00/:30 (horários de pico do agendador
+    # do GitHub Actions — schedules nesses momentos são frequentemente
+    # pulados, não só atrasados). Em maio/2026 isso fez o robô rodar só
+    # ~2x/dia em vez de 48x. Usar minutos "atípicos" reduz drasticamente
+    # o problema. Refs: docs.github.com/.../events-that-trigger-workflows#schedule
+    #
+    # Dias úteis (a cada 30 min, em :07 e :37) — seg a sex em UTC, dia inteiro:
+    - cron: '7,37 * * * 1-5'
+    # Fim de semana (a cada 3 horas em :17) — sáb e dom em UTC:
+    - cron: '17 */3 * * 0,6'
     #
     # Observação prática: por causa da diferença de fuso, nas faixas de
     # virada (sex à noite / dom à noite, horário do Brasil) a frequência
