@@ -142,6 +142,7 @@ SRE_API = SRE_BASE + "/rest/sitePublico/pesquisar"
 SRE_API_LISTA = SRE_API + "/detalhado"
 SRE_API_DETALHE = SRE_API + "/infOferta/{id}"
 SRE_API_PARTICIPANTES = SRE_API + "/participantes/{id}"
+SRE_API_REQUERIMENTO = SRE_API + "/requerimento/{id}"
 SRE_LINK_OFERTA = SRE_BASE + "/#/oferta-publica/{id}"
 
 # Fonte de reserva (Portal de Dados Abertos).
@@ -269,7 +270,7 @@ class Oferta:
     __slots__ = ("id", "processo", "protocolo", "tipo", "emissor",
                  "lider", "data", "status", "valor", "modalidade",
                  "rito", "categorias", "fase", "devedor", "coordenadores",
-                 "fonte")
+                 "campos", "fonte")
 
     def __init__(self):
         self.id = ""
@@ -287,6 +288,10 @@ class Oferta:
         self.fase = None
         self.devedor = ""
         self.coordenadores = []   # lista de nomes (demais coordenadores)
+        # Campos detalhados do endpoint requerimento/{id}:
+        # mapa de campoNome (normalizado) -> lista ordenada de valores únicos
+        # por série (vazios ignorados).
+        self.campos = {}
         self.fonte = "SRE"
 
     def chave(self) -> str:
@@ -429,6 +434,51 @@ def sre_coordenadores(sess: requests.Session, id_req: str, lider: str) -> list:
     except Exception as exc:  # noqa: BLE001
         log.warning("Falha ao buscar coordenadores da oferta %s: %s", id_req, exc)
     return []
+
+
+def sre_campos_requerimento(sess: requests.Session, id_req: str) -> dict:
+    """
+    Busca os campos detalhados da oferta (GET /requerimento/{id}) que ficam
+    dentro de grupos[].series[].loteInicial.camposCadastrados[].
+
+    Devolve um dict {campoNome_normalizado: [valores únicos não-vazios]}.
+    Quando há mais de uma série, valores diferentes entre as séries vêm
+    todos na lista, na ordem em que apareceram (sem duplicar).
+
+    Em caso de erro, devolve {} — esses campos são "extras", a ausência
+    não impede o alerta.
+    """
+    if not id_req:
+        return {}
+    try:
+        url = SRE_API_REQUERIMENTO.format(id=urllib.parse.quote(str(id_req)))
+        resp = sess.get(url, timeout=60)
+        if resp.status_code != 200:
+            log.warning("requerimento/%s devolveu HTTP %s", id_req, resp.status_code)
+            return {}
+        data = resp.json()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Falha ao buscar requerimento da oferta %s: %s", id_req, exc)
+        return {}
+
+    if not isinstance(data, dict):
+        return {}
+
+    acumulado: dict[str, list] = {}
+    for grupo in data.get("grupos", []) or []:
+        for serie in grupo.get("series", []) or []:
+            lote = serie.get("loteInicial") or {}
+            for c in lote.get("camposCadastrados", []) or []:
+                if not c.get("visivel", True):
+                    continue
+                nome = normalize(c.get("campoNome", ""))
+                valor = str(c.get("campoValor", "") or "").strip()
+                if not nome or not valor:
+                    continue
+                lst = acumulado.setdefault(nome, [])
+                if valor not in lst:
+                    lst.append(valor)
+    return acumulado
 
 
 def sre_registro_para_oferta(reg: dict) -> Oferta:
@@ -621,14 +671,29 @@ def link_da_oferta(o: Oferta) -> str:
     return SRE_BASE + "/#/consulta-oferta-publica"
 
 
+def _campo(o: Oferta, *nomes_normalizados: str, limite: int = 350) -> str:
+    """
+    Tenta encontrar em o.campos um valor para qualquer um dos nomes
+    normalizados informados (primeiro que existir vence). Junta valores
+    de múltiplas séries com " | ", trunca textos muito longos.
+    Devolve "" se nada existir.
+    """
+    for nome in nomes_normalizados:
+        valores = o.campos.get(nome)
+        if valores:
+            txt = " | ".join(valores)
+            if len(txt) > limite:
+                txt = txt[:limite].rstrip() + "…"
+            return txt
+    return ""
+
+
 def formatar_mensagem(o: Oferta) -> str:
     """Monta o texto (HTML) do alerta de uma oferta."""
     if o.fase == FASE_REGISTRADA:
         cabecalho = "✅ <b>Oferta registrada na CVM</b>"
-        rotulo_data = "Data"
     else:
         cabecalho = "📥 <b>Novo pedido de oferta em análise na CVM</b>"
-        rotulo_data = "Data"
 
     linhas = [
         cabecalho,
@@ -650,20 +715,47 @@ def formatar_mensagem(o: Oferta) -> str:
             lista = lista[:400].rstrip() + "…"
         linhas.append(f"🤝 <b>Demais coordenadores:</b> {html_escape(lista)}")
     if o.data:
-        linhas.append(f"📅 <b>{rotulo_data}:</b> {o.data.strftime('%d/%m/%Y')}")
+        linhas.append(f"📅 <b>Data:</b> {o.data.strftime('%d/%m/%Y')}")
     valor_txt = formatar_valor(o.valor)
     if valor_txt:
         linhas.append(f"💰 <b>Valor:</b> {valor_txt}")
+
+    # Campos detalhados (vindos do endpoint requerimento/{id}).
+    # Em análise: vencimento, avaliação de risco, remuneração máxima, amortização.
+    # Registrada: vencimento, remuneração máxima, remuneração final (pós BB), amortização.
+    # CRA/CRI usam "informações sobre remuneração" (sem "máxima").
+    venc = _campo(o, "data de vencimento")
+    if venc:
+        linhas.append(f"📆 <b>Vencimento:</b> {html_escape(venc)}")
+
+    risco = _campo(o, "avaliacao de risco", limite=300)
+    if risco and o.fase == FASE_ANALISE:
+        linhas.append(f"⚖️ <b>Avaliação de risco:</b> {html_escape(risco)}")
+
+    # Debêntures usam "remuneração máxima"; CRA/CRI usam "remuneração" (sem
+    # qualificador). Mostra o que existir.
+    remun_max = _campo(o, "informacoes sobre remuneracao maxima")
+    remun = _campo(o, "informacoes sobre remuneracao") if not remun_max else ""
+    if remun_max:
+        linhas.append(f"💵 <b>Remuneração máxima:</b> {html_escape(remun_max)}")
+    elif remun:
+        linhas.append(f"💵 <b>Remuneração:</b> {html_escape(remun)}")
+
+    remun_final = _campo(o, "informacoes sobre remuneracao final (pos bookbuilding)")
+    if remun_final and o.fase == FASE_REGISTRADA:
+        linhas.append(f"💵 <b>Remuneração final (pós BB):</b> "
+                      f"{html_escape(remun_final)}")
+
+    amort = _campo(o, "informacoes sobre amortizacao", limite=300)
+    if amort:
+        linhas.append(f"📉 <b>Amortização:</b> {html_escape(amort)}")
+
     if o.rito:
         linhas.append(f"📊 <b>Rito:</b> {html_escape(o.rito)}")
     if o.modalidade:
         linhas.append(f"📋 <b>Modalidade:</b> {html_escape(o.modalidade)}")
     if o.status:
         linhas.append(f"📌 <b>Situação:</b> {html_escape(o.status)}")
-    if o.protocolo:
-        linhas.append(f"🔢 <b>Protocolo:</b> {html_escape(o.protocolo)}")
-    if o.processo:
-        linhas.append(f"🗂️ <b>Processo:</b> {html_escape(o.processo)}")
     if o.fonte != "SRE":
         linhas.append(f"\n⚠️ <i>Dado da fonte de reserva ({html_escape(o.fonte)}) "
                       f"— pode estar defasado.</i>")
@@ -773,12 +865,15 @@ def verificar(dry_run: bool = False, notificar_primeira: bool = False) -> None:
 
     # Para as ofertas novas vindas do SRE, busca os detalhes extras:
     #  - coordenadores do consórcio (todas as ofertas);
+    #  - campos detalhados (vencimento, remuneração, amortização, ...);
     #  - devedor (só CRA/CRI, onde faz sentido).
     if sess is not None:
         for o in eventos:
             if not o.id:
                 continue
             o.coordenadores = sre_coordenadores(sess, o.id, o.lider)
+            time.sleep(0.3)
+            o.campos = sre_campos_requerimento(sess, o.id)
             time.sleep(0.3)
             if o.eh_cri_cra():
                 o.devedor = sre_detalhe_devedor(sess, o.id)

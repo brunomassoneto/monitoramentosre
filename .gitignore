@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+cvm_robo.log
+estado_ofertas.json
+estado_ofertas.tmp
+.venv/
+venv/
