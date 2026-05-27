@@ -46,6 +46,7 @@ on:
           - verificar          # verificação normal (envia alertas de ofertas novas)
           - testar-telegram    # só envia uma mensagem de teste
           - inspecionar        # só baixa os dados e mostra as colunas do CSV
+          - semear-silencioso  # marca ofertas atuais como já-vistas (sem notificar)
 
 # Evita que duas execuções rodem ao mesmo tempo (e disputem o cache).
 concurrency:
@@ -94,6 +95,9 @@ jobs:
               ;;
             inspecionar)
               python cvm_telegram_bot.py --inspect
+              ;;
+            semear-silencioso)
+              python cvm_telegram_bot.py --seed-silent
               ;;
             *)
               python cvm_telegram_bot.py

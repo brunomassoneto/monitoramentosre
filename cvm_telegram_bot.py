@@ -102,6 +102,13 @@ PADROES_TIPO = {
     "Notas Comerciais": [
         r"\bnotas?\s+comerci", r"\bnota\s+promissoria",
     ],
+    # "Outros títulos de securitização" — a própria string da API; também
+    # inclui "Certificados de Recebíveis" sem qualificador (securitização
+    # genérica, fora de CRA/CRI).
+    "Outros títulos de securitização": [
+        r"outros\s+titulos\s+de\s+securitiza",
+        r"^certificad\w*\s+de\s+recebiveis$",
+    ],
 }
 
 # Avisar também quando um pedido ENTRA EM ANÁLISE (além do alerta de registro)?
@@ -881,6 +888,34 @@ def modo_inspect() -> None:
         print("   (nenhuma oferta na janela agora)")
 
 
+def modo_seed_silent() -> None:
+    """
+    Coleta as ofertas atuais via SRE e adiciona ao estado as que ainda não
+    estão lá — SEM disparar notificações. Use ao introduzir uma nova
+    categoria em PADROES_TIPO: marca as ofertas já existentes na janela
+    como "já vistas", para não receber uma rajada histórica.
+    """
+    estado = carregar_estado()
+    ofertas_estado = dict(estado.get("ofertas", {}))
+    try:
+        ofertas, _ = coletar_do_sre()
+    except Exception as exc:  # noqa: BLE001
+        log.error("SRE falhou: %s — abortando seed.", exc)
+        return
+    adicionadas = 0
+    for o in ofertas:
+        ch = o.chave()
+        if ch not in ofertas_estado:
+            ofertas_estado[ch] = o.fase
+            adicionadas += 1
+    estado["ofertas"] = ofertas_estado
+    estado["primeira_execucao"] = False
+    salvar_estado(estado)
+    log.info("Seed silencioso: %d nova(s) oferta(s) marcada(s) como "
+             "já-vista(s) (de %d coletadas). Nenhum alerta enviado.",
+             adicionadas, len(ofertas))
+
+
 def modo_test_telegram() -> None:
     msg = ("✅ <b>Robô CVM → Telegram</b>\n\n"
            "Teste de conexão bem-sucedido. Você receberá um alerta aqui "
@@ -907,6 +942,9 @@ def main() -> None:
                         help="consulta a API e mostra o que o robô enxerga")
     parser.add_argument("--test-telegram", action="store_true",
                         help="envia uma mensagem de teste para o Telegram")
+    parser.add_argument("--seed-silent", action="store_true",
+                        help="marca as ofertas atuais como já-vistas SEM "
+                             "notificar (útil ao introduzir nova categoria)")
     parser.add_argument("--notify-on-first-run", action="store_true",
                         help="na primeira execução, notifica tudo da janela")
     args = parser.parse_args()
@@ -916,6 +954,9 @@ def main() -> None:
         return
     if args.test_telegram:
         modo_test_telegram()
+        return
+    if args.seed_silent:
+        modo_seed_silent()
         return
 
     if args.loop:

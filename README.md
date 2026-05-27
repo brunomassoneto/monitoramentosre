@@ -12,6 +12,7 @@ Ofertas dos tipos:
 - **CRI** — Certificado de Recebíveis Imobiliários
 - **Debêntures**
 - **Notas Comerciais** (e Notas Promissórias Comerciais)
+- **Outros títulos de securitização** (inclui "Certificados de Recebíveis" sem qualificador)
 
 E acompanha o **ciclo de vida** de cada oferta — pode enviar **dois alertas**:
 
@@ -126,11 +127,12 @@ Os horários do cron são em UTC (Brasil = UTC−3).
 
 Da aba **Actions** do repositório, **Run workflow** → escolha um modo:
 
-|Modo             |Para quê                                                                                                                             |
-|-----------------|-------------------------------------------------------------------------------------------------------------------------------------|
-|`verificar`      |Verificação normal — é o que o agendamento usa. Envia alertas das ofertas novas.                                                     |
-|`testar-telegram`|Manda só uma mensagem de teste, para validar token e chat_id.                                                                        |
-|`inspecionar`    |Consulta a API e mostra no log o que o robô está enxergando (status, contagem por tipo, exemplos de mensagem). Útil para diagnóstico.|
+|Modo                  |Para quê                                                                                                                             |
+|----------------------|-------------------------------------------------------------------------------------------------------------------------------------|
+|`verificar`           |Verificação normal — é o que o agendamento usa. Envia alertas das ofertas novas.                                                     |
+|`testar-telegram`     |Manda só uma mensagem de teste, para validar token e chat_id.                                                                        |
+|`inspecionar`         |Consulta a API e mostra no log o que o robô está enxergando (status, contagem por tipo, exemplos de mensagem). Útil para diagnóstico.|
+|`semear-silencioso`   |Marca todas as ofertas atuais da janela como “já-vistas” no estado, **sem disparar nada**. Útil ao adicionar uma nova categoria em `PADROES_TIPO` para não receber a rajada do histórico. |
 
 Também é possível rodar localmente, para testes:
 
