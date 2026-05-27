@@ -689,77 +689,124 @@ def _campo(o: Oferta, *nomes_normalizados: str, limite: int = 350) -> str:
 
 
 def formatar_mensagem(o: Oferta) -> str:
-    """Monta o texto (HTML) do alerta de uma oferta."""
+    """
+    Monta o texto (HTML) do alerta de uma oferta, em 3 blocos com hierarquia:
+
+      1. Identificação: cabeçalho de status, emissor em destaque, tipo·valor,
+         devedor (em CRA/CRI).
+      2. Números-chave: datas (emissão→vencimento), avaliação de risco (em
+         análise), remuneração (máxima e final), amortização.
+      3. Contexto distributivo (em itálico, sem emoji em cada linha):
+         coordenador líder, demais coordenadores, rito, modalidade·status.
+
+    O objetivo é facilitar o scaning rápido — o que importa fica em cima,
+    o contexto mais "administrativo" cai pro fim em itálico.
+    """
+    # --- Cabeçalho ---
     if o.fase == FASE_REGISTRADA:
         cabecalho = "✅ <b>Oferta registrada na CVM</b>"
     else:
         cabecalho = "📥 <b>Novo pedido de oferta em análise na CVM</b>"
+    linhas = [cabecalho, ""]
 
-    linhas = [
-        cabecalho,
-        "",
-        f"📄 <b>Tipo:</b> {html_escape(o.tipo or '(não informado)')}",
-        f"🏢 <b>Emissor:</b> {html_escape(o.emissor or '(não informado)')}",
-    ]
-    # Devedor (risco) só em CRA/CRI.
-    if o.eh_cri_cra() and o.devedor:
-        dev = o.devedor
-        if len(dev) > 500:           # textos muito longos: corta com reticências
-            dev = dev[:500].rstrip() + "…"
-        linhas.append(f"🎯 <b>Devedor (risco):</b> {html_escape(dev)}")
-    if o.lider:
-        linhas.append(f"🏦 <b>Coordenador líder:</b> {html_escape(o.lider)}")
-    if o.coordenadores:
-        lista = ", ".join(o.coordenadores)
-        if len(lista) > 400:             # muitos coordenadores: corta
-            lista = lista[:400].rstrip() + "…"
-        linhas.append(f"🤝 <b>Demais coordenadores:</b> {html_escape(lista)}")
-    if o.data:
-        linhas.append(f"📅 <b>Data:</b> {o.data.strftime('%d/%m/%Y')}")
+    # --- Bloco 1: identificação ---
+    if o.emissor:
+        linhas.append(f"<b>{html_escape(o.emissor)}</b>")
+    id_partes = []
+    if o.tipo:
+        id_partes.append(html_escape(o.tipo))
     valor_txt = formatar_valor(o.valor)
     if valor_txt:
-        linhas.append(f"💰 <b>Valor:</b> {valor_txt}")
+        id_partes.append(valor_txt)
+    if id_partes:
+        linhas.append("  ·  ".join(id_partes))
 
-    # Campos detalhados (vindos do endpoint requerimento/{id}).
-    # Em análise: vencimento, avaliação de risco, remuneração máxima, amortização.
-    # Registrada: vencimento, remuneração máxima, remuneração final (pós BB), amortização.
-    # CRA/CRI usam "informações sobre remuneração" (sem "máxima").
+    if o.eh_cri_cra() and o.devedor:
+        dev = o.devedor
+        if len(dev) > 500:
+            dev = dev[:500].rstrip() + "…"
+        linhas.append(f"🎯 <i>Devedor (risco):</i> {html_escape(dev)}")
+
+    # --- Bloco 2: números-chave ---
+    bloco_numeros: list[str] = []
+
+    # Linha de datas: "📅 data  →  📆 vencimento" (junto se ambas existem)
     venc = _campo(o, "data de vencimento")
-    if venc:
-        linhas.append(f"📆 <b>Vencimento:</b> {html_escape(venc)}")
+    if o.data and venc:
+        bloco_numeros.append(
+            f"📅 {o.data.strftime('%d/%m/%Y')}  →  📆 {html_escape(venc)}"
+        )
+    elif o.data:
+        bloco_numeros.append(f"📅 {o.data.strftime('%d/%m/%Y')}")
+    elif venc:
+        bloco_numeros.append(f"📆 <i>Vencimento:</i> {html_escape(venc)}")
 
+    # Avaliação de risco — só em análise
     risco = _campo(o, "avaliacao de risco", limite=300)
     if risco and o.fase == FASE_ANALISE:
-        linhas.append(f"⚖️ <b>Avaliação de risco:</b> {html_escape(risco)}")
+        bloco_numeros.append(f"⚖️ <i>Avaliação de risco:</i> {html_escape(risco)}")
 
-    # Debêntures usam "remuneração máxima"; CRA/CRI usam "remuneração" (sem
-    # qualificador). Mostra o que existir.
+    # Remuneração: debêntures usam "máxima"; CRA/CRI usam genérica.
+    # "Final (pós BB)" só faz sentido depois de registrada.
     remun_max = _campo(o, "informacoes sobre remuneracao maxima")
     remun = _campo(o, "informacoes sobre remuneracao") if not remun_max else ""
     if remun_max:
-        linhas.append(f"💵 <b>Remuneração máxima:</b> {html_escape(remun_max)}")
+        bloco_numeros.append(
+            f"💵 <i>Remuneração máxima:</i> {html_escape(remun_max)}"
+        )
     elif remun:
-        linhas.append(f"💵 <b>Remuneração:</b> {html_escape(remun)}")
-
+        bloco_numeros.append(f"💵 <i>Remuneração:</i> {html_escape(remun)}")
     remun_final = _campo(o, "informacoes sobre remuneracao final (pos bookbuilding)")
     if remun_final and o.fase == FASE_REGISTRADA:
-        linhas.append(f"💵 <b>Remuneração final (pós BB):</b> "
-                      f"{html_escape(remun_final)}")
+        bloco_numeros.append(
+            f"💵 <i>Remuneração final (pós BB):</i> {html_escape(remun_final)}"
+        )
 
     amort = _campo(o, "informacoes sobre amortizacao", limite=300)
     if amort:
-        linhas.append(f"📉 <b>Amortização:</b> {html_escape(amort)}")
+        bloco_numeros.append(f"📉 <i>Amortização:</i> {html_escape(amort)}")
 
+    if bloco_numeros:
+        linhas.append("")
+        linhas.extend(bloco_numeros)
+
+    # --- Bloco 3: contexto distributivo (sem emoji) ---
+    bloco_contexto: list[str] = []
+    if o.lider:
+        bloco_contexto.append(f"<i>Coordenador líder:</i> {html_escape(o.lider)}")
+    if o.coordenadores:
+        lista = ", ".join(o.coordenadores)
+        if len(lista) > 400:
+            lista = lista[:400].rstrip() + "…"
+        bloco_contexto.append(
+            f"<i>Demais coordenadores:</i> {html_escape(lista)}"
+        )
     if o.rito:
-        linhas.append(f"📊 <b>Rito:</b> {html_escape(o.rito)}")
+        bloco_contexto.append(f"<i>Rito:</i> {html_escape(o.rito)}")
+    mod_status = []
     if o.modalidade:
-        linhas.append(f"📋 <b>Modalidade:</b> {html_escape(o.modalidade)}")
+        mod_status.append(f"<i>Modalidade:</i> {html_escape(o.modalidade)}")
     if o.status:
-        linhas.append(f"📌 <b>Situação:</b> {html_escape(o.status)}")
+        mod_status.append(f"<i>Status:</i> {html_escape(o.status)}")
+    if mod_status:
+        bloco_contexto.append("  ·  ".join(mod_status))
+
+    if bloco_contexto:
+        linhas.append("")
+        linhas.extend(bloco_contexto)
+
+    # --- Aviso defensivo de fonte reserva (não esperado em uso normal) ---
     if o.fonte != "SRE":
-        linhas.append(f"\n⚠️ <i>Dado da fonte de reserva ({html_escape(o.fonte)}) "
-                      f"— pode estar defasado.</i>")
-    linhas += ["", f'🔗 <a href="{link_da_oferta(o)}">Abrir a oferta no SRE</a>']
+        linhas.append("")
+        linhas.append(
+            f"⚠️ <i>Dado da fonte de reserva ({html_escape(o.fonte)}) — "
+            f"pode estar defasado.</i>"
+        )
+
+    # --- Footer com link ---
+    linhas.append("")
+    linhas.append(f'🔗 <a href="{link_da_oferta(o)}">Abrir no SRE</a>')
+
     return "\n".join(linhas)
 
 
