@@ -115,8 +115,14 @@ falsos positivos (flood). Ainda dá pra inspecioná-lo manualmente via
 
 O robô roda automaticamente pelo GitHub Actions:
 
-- **Dias úteis:** uma verificação a cada **30 minutos**.
-- **Fins de semana:** uma verificação a cada **3 horas**.
+- **Dias úteis:** 11 tentativas por hora (a cada 5 min, exceto :00 UTC).
+- **Fins de semana:** 1 tentativa por hora.
+
+O `schedule:` do GitHub Actions pula muitas execuções sob carga (em maio/26
+chegou a só ~5% das execuções esperadas). A estratégia atual é **saturar o
+agendador**: como o repo é público e os minutos de Actions são ilimitados,
+disparamos com frequência alta o suficiente para que, mesmo com ~70-80% de
+skip, ainda rodemos várias vezes por hora.
 
 O agendamento é definido pelos `cron` no arquivo `.github/workflows/cvm-robo.yml`.
 Os horários do cron são em UTC (Brasil = UTC−3).

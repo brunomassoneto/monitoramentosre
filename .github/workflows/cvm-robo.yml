@@ -13,26 +13,27 @@ name: Robô CVM → Telegram
 
 on:
   schedule:
-    # IMPORTANTE: o cron do GitHub Actions é sempre em UTC. O Brasil é UTC-3.
-    # Os dias-da-semana abaixo (campo final do cron) também são em UTC, então
-    # foram escolhidos para que o resultado, no horário do Brasil, seja:
-    #   - segunda a sexta: uma verificação a cada 30 minutos;
-    #   - sábado e domingo: uma verificação a cada 3 horas.
+    # IMPORTANTE: o cron do GitHub Actions é sempre em UTC.
     #
-    # Como UTC está 3h à frente, o "dia útil brasileiro" das 00h às 21h
-    # corresponde a segunda-a-sexta em UTC; as 21h-24h do Brasil já são o
-    # dia seguinte em UTC. Para manter simples e robusto, usamos:
+    # ESTRATÉGIA — saturar o agendador. O `schedule:` do GitHub Actions
+    # pula MUITAS execuções sob carga (em maio/26 com `*/30` rodou só ~5%
+    # do esperado; com `7,37` chegou a ~15%). Como o repo é público, os
+    # minutos de Actions são ilimitados — então a tática é disparar com
+    # frequência alta o suficiente para que, mesmo com ~70-80% de skip,
+    # ainda rodemos várias vezes por hora.
     #
-    # IMPORTANTE: NÃO usamos os minutos :00/:30 (horários de pico do agendador
-    # do GitHub Actions — schedules nesses momentos são frequentemente
-    # pulados, não só atrasados). Em maio/2026 isso fez o robô rodar só
-    # ~2x/dia em vez de 48x. Usar minutos "atípicos" reduz drasticamente
-    # o problema. Refs: docs.github.com/.../events-that-trigger-workflows#schedule
+    # Evitamos o minuto :00 (pico do agendador onde o skip rate é mais
+    # alto). Os outros minutos são usados sem cerimônia.
     #
-    # Dias úteis (a cada 30 min, em :07 e :37) — seg a sex em UTC, dia inteiro:
-    - cron: '7,37 * * * 1-5'
-    # Fim de semana (a cada 3 horas em :17) — sáb e dom em UTC:
-    - cron: '17 */3 * * 0,6'
+    # Refs:
+    #   docs.github.com/en/actions/.../events-that-trigger-workflows#schedule
+    #   "Scheduled workflows can be delayed during periods of high loads
+    #    of GitHub Actions workflow runs."
+    #
+    # Dias úteis: 11 disparos por hora (a cada 5 min, exceto :00).
+    - cron: '5,10,15,20,25,30,35,40,45,50,55 * * * 1-5'
+    # Fim de semana: 1 disparo por hora (movimento menor de ofertas).
+    - cron: '15 * * * 0,6'
     #
     # Observação prática: por causa da diferença de fuso, nas faixas de
     # virada (sex à noite / dom à noite, horário do Brasil) a frequência
