@@ -136,6 +136,21 @@ JANELA_DIAS = int(os.environ.get("JANELA_DIAS", "45"))
 # sobra; aumente se o robô ficar muito tempo sem rodar.
 QTD_OFERTAS_VERIFICAR = int(os.environ.get("QTD_OFERTAS_VERIFICAR", "200"))
 
+# A API do SRE recusa/derruba conexões de forma INTERMITENTE quando acessada
+# dos runners do GitHub (datacenter fora do Brasil): ~metade das tentativas
+# falha no connect, mas a tentativa seguinte costuma funcionar. Por isso o
+# robô tenta várias vezes antes de desistir.
+SRE_TENTATIVAS = int(os.environ.get("SRE_TENTATIVAS", "5"))
+# Timeout (connect, read) em segundos. Connect curto para falhar rápido e
+# partir logo para a próxima tentativa; read mais folgado.
+SRE_TIMEOUT = (
+    int(os.environ.get("SRE_CONNECT_TIMEOUT", "15")),
+    int(os.environ.get("SRE_READ_TIMEOUT", "60")),
+)
+# Só avisa "modo reserva" no Telegram depois de N verificações consecutivas
+# falhando (uma falha isolada — comum e transitória — não gera mensagem).
+LIMIAR_AVISO_RESERVA = int(os.environ.get("LIMIAR_AVISO_RESERVA", "2"))
+
 # --- Fontes de dados --------------------------------------------------
 SRE_BASE = "https://web.cvm.gov.br/sre-publico-cvm"
 SRE_API = SRE_BASE + "/rest/sitePublico/pesquisar"
@@ -315,7 +330,7 @@ def _nova_sessao() -> requests.Session:
     sess = requests.Session()
     sess.headers.update(HEADERS_NAVEGADOR)
     try:
-        sess.get(SRE_BASE + "/", timeout=60)   # pega JSESSIONID, se houver
+        sess.get(SRE_BASE + "/", timeout=SRE_TIMEOUT)   # pega JSESSIONID, se houver
     except Exception as exc:  # noqa: BLE001
         log.warning("Não consegui visitar a home do SRE (seguindo mesmo assim): %s", exc)
     return sess
@@ -351,7 +366,7 @@ def sre_listar_ofertas(sess: requests.Session, limite: int) -> list:
     pagina = 1
     while len(coletados) < limite:
         payload = _payload_lista(pagina, por_pagina)
-        resp = sess.post(SRE_API_LISTA, json=payload, timeout=60)
+        resp = sess.post(SRE_API_LISTA, json=payload, timeout=SRE_TIMEOUT)
         if resp.status_code != 200:
             raise RuntimeError(f"SRE /detalhado devolveu HTTP {resp.status_code}")
         data = resp.json()
@@ -526,6 +541,33 @@ def coletar_do_sre():
         vistos.add(ch)
         ofertas.append(o)
     return ofertas, sess
+
+
+def coletar_do_sre_resiliente():
+    """
+    Chama coletar_do_sre() com várias tentativas e backoff crescente.
+
+    A API do SRE costuma recusar a conexão de forma intermitente quando
+    acessada de fora do Brasil (runners do GitHub): a falha é por tentativa
+    e independente, então repetir quase sempre resolve. Cada tentativa cria
+    uma sessão nova (conexão nova). Lança a última exceção se todas falharem.
+    """
+    ultima_exc = None
+    for tentativa in range(1, SRE_TENTATIVAS + 1):
+        try:
+            resultado = coletar_do_sre()
+            if tentativa > 1:
+                log.info("SRE respondeu na tentativa %d/%d.",
+                         tentativa, SRE_TENTATIVAS)
+            return resultado
+        except Exception as exc:  # noqa: BLE001
+            ultima_exc = exc
+            log.warning("SRE tentativa %d/%d falhou: %s",
+                        tentativa, SRE_TENTATIVAS, exc)
+            if tentativa < SRE_TENTATIVAS:
+                # backoff: 3s, 6s, 9s, ... (teto de 20s)
+                time.sleep(min(3 * tentativa, 20))
+    raise ultima_exc
 
 
 # -------------------------------------------------------------------
@@ -818,14 +860,16 @@ def verificar(dry_run: bool = False, notificar_primeira: bool = False) -> None:
     primeira = estado.get("primeira_execucao", False) or not STATE_FILE.exists()
     ofertas_estado = dict(estado.get("ofertas", {}))
 
-    # Tenta SRE direto. Se falhar, vai para modo reserva (sem chamar o
-    # fallback do Portal de Dados Abertos: a comparação seria inviável por
-    # causa dos identificadores diferentes — ver bloco abaixo).
+    # Tenta SRE com várias tentativas (as conexões falham de forma
+    # intermitente a partir dos runners do GitHub). Se TODAS falharem, vai
+    # para modo reserva (sem chamar o fallback do Portal de Dados Abertos: a
+    # comparação seria inviável por causa dos identificadores diferentes).
     try:
-        ofertas, sess = coletar_do_sre()
+        ofertas, sess = coletar_do_sre_resiliente()
         usou_reserva = False
     except Exception as exc:  # noqa: BLE001
-        log.error("Fonte principal (SRE) falhou: %s", exc)
+        log.error("Fonte principal (SRE) falhou após %d tentativas: %s",
+                  SRE_TENTATIVAS, exc)
         ofertas, sess, usou_reserva = [], None, True
 
     n_analise = sum(1 for o in ofertas if o.fase == FASE_ANALISE)
@@ -838,44 +882,57 @@ def verificar(dry_run: bool = False, notificar_primeira: bool = False) -> None:
     # histórico inteiro e usa identificadores diferentes dos do SRE — então
     # comparar com o estado salvo gera milhares de falsos positivos. Para
     # evitar o flood, quando estamos no modo reserva NÃO disparamos alertas
-    # individuais e NÃO alteramos o estado. Mandamos no máximo um aviso a
-    # cada 12 horas para você saber que o robô está degradado. Quando a API
-    # do SRE voltar, as ofertas reais que apareceram nesse intervalo são
-    # capturadas naturalmente pela próxima verificação via SRE.
+    # individuais e NÃO alteramos o estado das ofertas. Quando a API do SRE
+    # volta, as ofertas reais do período são capturadas na próxima verificação.
+    #
+    # Anti-ruído: uma falha ISOLADA do SRE é comum e transitória, então não
+    # vale uma mensagem. Só avisamos depois de LIMIAR_AVISO_RESERVA
+    # verificações CONSECUTIVAS falhando (= a CVM está realmente fora por
+    # horas), e ainda assim no máximo uma vez a cada 12h.
     if usou_reserva:
-        ultimo_aviso = estado.get("ultimo_aviso_reserva")
+        falhas = int(estado.get("falhas_consecutivas", 0) or 0) + 1
+        estado["falhas_consecutivas"] = falhas
         agora = datetime.now()
-        precisa_avisar = True
-        if ultimo_aviso:
+
+        precisa_avisar = falhas >= LIMIAR_AVISO_RESERVA
+        ultimo_aviso = estado.get("ultimo_aviso_reserva")
+        if precisa_avisar and ultimo_aviso:
             try:
                 ts = datetime.fromisoformat(ultimo_aviso)
                 if (agora - ts) < timedelta(hours=12):
                     precisa_avisar = False
             except ValueError:
                 pass
+
         if precisa_avisar:
             msg_reserva = (
                 "⚠️ <b>Robô CVM em modo reserva</b>\n\n"
-                "A fonte principal (API do SRE) não respondeu. O robô está "
-                "operando em modo degradado: <b>alertas individuais foram "
-                "suspensos</b> nesta janela para evitar flood (a fonte de "
-                "reserva traz o histórico inteiro, sem identificadores "
-                "estáveis).\n\n"
-                "Assim que a API do SRE voltar a responder, as ofertas reais "
+                "A fonte principal (API do SRE) não responde há algumas "
+                "verificações seguidas. O robô está em modo degradado: "
+                "<b>alertas individuais suspensos</b> até a fonte voltar.\n\n"
+                "Assim que a API do SRE responder de novo, as ofertas reais "
                 "do período são notificadas normalmente. Se este aviso "
-                "persistir por mais de algumas horas, a API do SRE pode ter "
-                "mudado e o robô precisa de revisão.")
+                "persistir por horas, a API do SRE pode ter mudado e o robô "
+                "precisa de revisão.")
             if dry_run:
                 print("\n----- (DRY-RUN) [aviso modo reserva] -----")
                 print(msg_reserva)
                 print("-" * 40)
-            else:
-                if enviar_telegram(msg_reserva):
-                    estado["ultimo_aviso_reserva"] = agora.isoformat(timespec="seconds")
-                    # Não mexemos em ofertas_estado nem em primeira_execucao.
-                    salvar_estado(estado)
-        log.info("Modo reserva ativo: alertas suspensos; estado preservado.")
+            elif enviar_telegram(msg_reserva):
+                estado["ultimo_aviso_reserva"] = agora.isoformat(timespec="seconds")
+
+        if not dry_run:
+            salvar_estado(estado)   # persiste o contador de falhas sempre
+        log.info("Modo reserva ativo (%dª falha consecutiva); alertas "
+                 "suspensos; estado preservado.%s", falhas,
+                 "" if precisa_avisar else " (aviso suprimido)")
         return
+
+    # SRE respondeu: zera o contador de falhas consecutivas.
+    if estado.get("falhas_consecutivas"):
+        log.info("SRE recuperado após %s falha(s) consecutiva(s).",
+                 estado.get("falhas_consecutivas"))
+    estado["falhas_consecutivas"] = 0
 
     # Primeira execução (só pela fonte principal): semeia o estado sem notificar.
     if primeira and not notificar_primeira:
