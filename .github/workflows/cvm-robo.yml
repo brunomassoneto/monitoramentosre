@@ -92,6 +92,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_ADMIN_CHAT_ID: ${{ secrets.TELEGRAM_ADMIN_CHAT_ID }}
           # Em execução agendada não há "input"; o padrão vira 'verificar'.
           MODO: ${{ github.event.inputs.modo || 'verificar' }}
         run: |

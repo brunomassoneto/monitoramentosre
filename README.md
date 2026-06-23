@@ -101,6 +101,12 @@ seja, quando a CVM está realmente fora por horas, não num blip transitório de
 uma execução isolada. Mesmo assim, no máximo um aviso a cada 12h. Um contador
 (`falhas_consecutivas`) no estado é zerado assim que o SRE responde.
 
+Esse aviso é **administrativo** (diagnóstico, não uma oferta real) e por isso
+vai para **`TELEGRAM_ADMIN_CHAT_ID`** (DM privada com o bot), não para o
+canal/grupo principal — assim quem está no grupo só recebe alertas de ofertas
+de verdade. Se a variável não for configurada, cai de volta no
+`TELEGRAM_CHAT_ID` normal (canal).
+
 **Por que não usar o Portal de Dados Abertos como reserva ativa?** Porque
 o Portal contém o histórico inteiro de ofertas e usa identificadores
 diferentes dos do SRE — comparar com o estado salvo gera milhares de
@@ -172,6 +178,7 @@ Também é possível rodar localmente, para testes:
 pip install -r requirements.txt
 export TELEGRAM_BOT_TOKEN="..."
 export TELEGRAM_CHAT_ID="..."
+export TELEGRAM_ADMIN_CHAT_ID="..."  # opcional — DM para avisos de modo reserva
 python cvm_telegram_bot.py --inspect        # mostra o que o robô enxerga
 python cvm_telegram_bot.py --test-telegram  # envia uma mensagem de teste
 python cvm_telegram_bot.py --dry-run        # verifica mas imprime em vez de enviar

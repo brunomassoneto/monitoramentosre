@@ -85,6 +85,10 @@ except ImportError:
 # aqui se o código for para um repositório.
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "COLE_AQUI_O_TOKEN_DO_BOT")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "COLE_AQUI_O_CHAT_ID")
+# Chat privado (DM com o bot) para avisos administrativos como "modo
+# reserva" — não vai pro canal/grupo público. Se não configurado, cai no
+# TELEGRAM_CHAT_ID normal (mesmo comportamento de antes).
+TELEGRAM_ADMIN_CHAT_ID = os.environ.get("TELEGRAM_ADMIN_CHAT_ID", "") or TELEGRAM_CHAT_ID
 
 # --- O que monitorar --------------------------------------------------
 # Padrões (regex) que casam SEM acento e SEM diferenciar maiúsculas. Casam
@@ -664,14 +668,15 @@ def salvar_estado(estado: dict) -> None:
 # -------------------------------------------------------------------
 # Telegram
 # -------------------------------------------------------------------
-def enviar_telegram(texto: str) -> bool:
+def enviar_telegram(texto: str, chat_id: str = None) -> bool:
+    destino = chat_id or TELEGRAM_CHAT_ID
     if (not TELEGRAM_BOT_TOKEN or "COLE_AQUI" in TELEGRAM_BOT_TOKEN
-            or not TELEGRAM_CHAT_ID or "COLE_AQUI" in TELEGRAM_CHAT_ID):
-        log.error("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID não configurados.")
+            or not destino or "COLE_AQUI" in destino):
+        log.error("TELEGRAM_BOT_TOKEN / chat_id não configurados.")
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
+        "chat_id": destino,
         "text": texto,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
@@ -918,7 +923,7 @@ def verificar(dry_run: bool = False, notificar_primeira: bool = False) -> None:
                 print("\n----- (DRY-RUN) [aviso modo reserva] -----")
                 print(msg_reserva)
                 print("-" * 40)
-            elif enviar_telegram(msg_reserva):
+            elif enviar_telegram(msg_reserva, chat_id=TELEGRAM_ADMIN_CHAT_ID):
                 estado["ultimo_aviso_reserva"] = agora.isoformat(timespec="seconds")
 
         if not dry_run:
