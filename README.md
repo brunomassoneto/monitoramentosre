@@ -145,19 +145,24 @@ falsos positivos (flood). Ainda dá pra inspecioná-lo manualmente via
 
 ## Agendamento
 
-O robô roda automaticamente pelo GitHub Actions:
+O robô roda automaticamente pelo GitHub Actions, **só entre 07h e 24h
+(horário de Brasília)** — de madrugada (00h-07h BRT) não há expediente na
+CVM, então o agendamento fica em silêncio e não desperdiça tentativas:
 
-- **Dias úteis:** 11 tentativas por hora (a cada 5 min, exceto :00 UTC).
-- **Fins de semana:** 1 tentativa por hora.
+- **Dias úteis, 07h-24h BRT:** ~29 tentativas por hora (a cada 2 min, exceto :00).
+- **Fins de semana, 07h-24h BRT:** 6 tentativas por hora (movimento menor de ofertas).
+- **Madrugada (00h-07h BRT), todos os dias:** nenhuma tentativa.
 
-O `schedule:` do GitHub Actions pula muitas execuções sob carga (em maio/26
-chegou a só ~5% das execuções esperadas). A estratégia atual é **saturar o
-agendador**: como o repo é público e os minutos de Actions são ilimitados,
-disparamos com frequência alta o suficiente para que, mesmo com ~70-80% de
-skip, ainda rodemos várias vezes por hora.
+O `schedule:` do GitHub Actions pula muitas execuções sob carga (best
+effort, sem SLA). Medindo run real por hora (jun/26), a taxa de acerto por
+tentativa de madrugada era só ~2%, contra ~4-5% durante o dia — então em vez
+de "saturar" o dia inteiro, a estratégia agora é **concentrar a densidade só
+no horário que importa**, onde cada tentativa converte melhor e onde
+ofertas realmente aparecem.
 
-O agendamento é definido pelos `cron` no arquivo `.github/workflows/cvm-robo.yml`.
-Os horários do cron são em UTC (Brasil = UTC−3).
+O agendamento é definido pelos `cron` no arquivo `.github/workflows/cvm-robo.yml`
+(4 entradas, por causa da virada UTC↔BRT no fim do dia). Os horários do cron
+são em UTC (Brasil = UTC−3).
 
 -----
 
