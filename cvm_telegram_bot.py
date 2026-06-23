@@ -1126,9 +1126,21 @@ def modo_test_telegram() -> None:
            "quando um pedido de oferta de CRA, CRI, debênture ou nota "
            "comercial entrar em análise — e outro quando for registrada.")
     if enviar_telegram(msg):
-        log.info("Mensagem de teste enviada com sucesso. ✅")
+        log.info("Mensagem de teste enviada com sucesso (canal). ✅")
     else:
-        log.error("Falha ao enviar a mensagem de teste. Confira os Secrets.")
+        log.error("Falha ao enviar a mensagem de teste no canal. Confira os Secrets.")
+
+    if TELEGRAM_ADMIN_CHAT_ID and TELEGRAM_ADMIN_CHAT_ID != TELEGRAM_CHAT_ID:
+        msg_admin = ("✅ <b>Robô CVM → canal admin</b>\n\n"
+                     "Teste de conexão com o chat administrativo bem-sucedido. "
+                     "Avisos de \"modo reserva\" chegam aqui, não no canal "
+                     "principal.")
+        if enviar_telegram(msg_admin, chat_id=TELEGRAM_ADMIN_CHAT_ID):
+            log.info("Mensagem de teste enviada com sucesso (admin). ✅")
+        else:
+            log.error("Falha ao enviar a mensagem de teste no admin. "
+                       "Confira TELEGRAM_ADMIN_CHAT_ID e se você já mandou "
+                       "/start para o bot na DM.")
 
 
 # -------------------------------------------------------------------
