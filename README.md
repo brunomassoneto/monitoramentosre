@@ -222,9 +222,21 @@ Tudo no bloco **CONFIGURAÇÃO**:
 - **O cache do GitHub Actions guarda o estado** (`estado_ofertas.json`) entre
   execuções. Não apague — apagar faz o robô tratar tudo como “primeira
   execução” (semeia sem notificar). Em uso normal, deixe quieto.
-- **Se passar 60 dias sem nenhum commit no repositório**, o GitHub pausa o
-  agendamento automático e avisa por e-mail. Para reativar, vá em Actions e
-  reabilite, ou faça qualquer commit.
+- **Inatividade de 60 dias (já tratado automaticamente).** O GitHub desativa
+  workflows agendados em repositórios públicos depois de 60 dias sem nenhum
+  commit — e como este robô guarda o estado no cache, ele nunca commita
+  sozinho. Foi assim que o robô parou em 22/08/2026 (último commit em
+  23/06, exatamente 60 dias antes). Hoje o workflow tem um passo de
+  **keepalive** que empurra um commit vazio quando o repositório passa de 50
+  dias parado, zerando o contador. Não precisa fazer nada.
+  - Se mesmo assim o robô for desativado, o GitHub avisa por e-mail. Para
+    reativar: aba **Actions** → workflow **Robô CVM → Telegram** → menu
+    `···` → **Enable workflow**. Um commit novo **não** basta: depois de
+    desativado, a reativação é manual.
+  - Atenção ao **cache do estado**, que expira 7 dias sem acesso. Reativando
+    dentro desse prazo, o robô continua de onde parou; passando disso, ele
+    trata a volta como “primeira execução” (registra tudo sem notificar) e
+    as ofertas do intervalo não são alertadas.
 - **Se chegar um aviso de “modo reserva” no canal**, é sinal de que a API do
   SRE não respondeu em **2+ verificações seguidas** (a CVM está fora há
   horas). Os alertas individuais ficam suspensos nesse intervalo. O aviso é
