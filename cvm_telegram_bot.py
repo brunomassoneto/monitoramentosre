@@ -12,7 +12,9 @@ canal do Telegram quando:
 A mesma oferta pode gerar dois alertas ao longo do ciclo:
 "📥 em análise"  ->  "✅ registrada".
 
-Tipos monitorados: CRA, CRI, Debêntures e Notas Comerciais.
+Tipos monitorados: CRA, CRI, Debêntures, Notas Comerciais, Outros títulos
+de securitização, CPR (Cédula de Produto Rural Financeira), FIAGRO,
+Fundos de Infraestrutura e Ações.
 
 Fonte de dados — principal
 --------------------------
@@ -113,6 +115,29 @@ PADROES_TIPO = {
         r"outros\s+titulos\s+de\s+securitiza",
         r"^certificad\w*\s+de\s+recebiveis$",
     ],
+    # CPR — na prática a CVM registra só a modalidade FINANCEIRA (CPR-F);
+    # o censo de tipos de 25/08/2026 (2000 ofertas / 730 dias) mostrou
+    # 'Cédula de Produto Rural Financeira' como a única grafia usada, sem
+    # nenhuma "Cédula de Produto Rural" pura. O padrão abaixo casa as duas
+    # de propósito: se a CVM passar a registrar a modalidade simples, ela
+    # entra sozinha, sem precisar mexer aqui.
+    "CPR — Cédula de Produto Rural": [
+        r"\bcpr\b",
+        r"\bcedulas?\s+de\s+produto\s+rural",
+    ],
+    # Cotas de fundos e ações. Grafias confirmadas pelo censo de 25/08/2026:
+    # 'Cotas de FIAGRO', 'Cotas de Fundos de Infra' e 'Ações'.
+    # NÃO inclui FIDC/FII/FIP/FIF (juntos, ~60% de todas as ofertas do SRE) —
+    # foram deixados de fora de propósito, para não afogar o canal.
+    "FIAGRO — Fundo de Investimento nas Cadeias Agroindustriais": [
+        r"\bfiagro\b",
+    ],
+    "Fundos de Infraestrutura": [
+        r"\bfundos?\s+de\s+infra",
+    ],
+    "Ações": [
+        r"\bacoes\b",
+    ],
 }
 
 # Avisar também quando um pedido ENTRA EM ANÁLISE (além do alerta de registro)?
@@ -139,6 +164,13 @@ JANELA_DIAS = int(os.environ.get("JANELA_DIAS", "45"))
 # data desc, então as mais novas vêm primeiro). 200 cobre vários dias de
 # sobra; aumente se o robô ficar muito tempo sem rodar.
 QTD_OFERTAS_VERIFICAR = int(os.environ.get("QTD_OFERTAS_VERIFICAR", "200"))
+
+# Amplitude do "censo de tipos" do modo --inspect. Precisa ser MUITO maior
+# que a verificação normal: tipo raro (poucas emissões por ano) não aparece
+# olhando só para os últimos meses, e sem vê-lo não dá para escrever o
+# padrão certo em PADROES_TIPO.
+INSPECT_QTD = int(os.environ.get("INSPECT_QTD", "2000"))
+INSPECT_DIAS = int(os.environ.get("INSPECT_DIAS", "730"))
 
 # A API do SRE recusa/derruba conexões de forma INTERMITENTE quando acessada
 # dos runners do GitHub (datacenter fora do Brasil): ~metade das tentativas
@@ -340,10 +372,17 @@ def _nova_sessao() -> requests.Session:
     return sess
 
 
-def _payload_lista(pagina: int, tamanho: int) -> dict:
-    """Monta o corpo do POST /detalhado para uma página de resultados."""
+def _payload_lista(pagina: int, tamanho: int, dias: int = None) -> dict:
+    """
+    Monta o corpo do POST /detalhado para uma página de resultados.
+
+    'dias' amplia a janela de busca; usado pelo censo de tipos do --inspect,
+    que precisa olhar bem mais para trás que a verificação normal.
+    """
     hoje = datetime.now()
-    de = (hoje - timedelta(days=max(JANELA_DIAS * 2, 120))).strftime("%d/%m/%Y")
+    if dias is None:
+        dias = max(JANELA_DIAS * 2, 120)
+    de = (hoje - timedelta(days=dias)).strftime("%d/%m/%Y")
     ate = (hoje + timedelta(days=1)).strftime("%d/%m/%Y")
     periodo = {"de": de, "ate": ate}
     return {
@@ -359,7 +398,8 @@ def _payload_lista(pagina: int, tamanho: int) -> dict:
     }
 
 
-def sre_listar_ofertas(sess: requests.Session, limite: int) -> list:
+def sre_listar_ofertas(sess: requests.Session, limite: int,
+                       dias: int = None) -> list:
     """
     Busca as ofertas mais recentes via POST /detalhado, paginando até atingir
     'limite' registros. Devolve uma lista de dicts crus da API.
@@ -369,7 +409,7 @@ def sre_listar_ofertas(sess: requests.Session, limite: int) -> list:
     coletados = []
     pagina = 1
     while len(coletados) < limite:
-        payload = _payload_lista(pagina, por_pagina)
+        payload = _payload_lista(pagina, por_pagina, dias)
         resp = sess.post(SRE_API_LISTA, json=payload, timeout=SRE_TIMEOUT)
         if resp.status_code != 200:
             raise RuntimeError(f"SRE /detalhado devolveu HTTP {resp.status_code}")
@@ -1072,6 +1112,36 @@ def modo_inspect() -> None:
         print(f"   {c}")
         print(f"      total: {cont_total[c]:>5}  |  análise: {cont_analise[c]:>4}"
               f"  |  registradas: {cont_reg[c]:>4}")
+
+    # ---- Censo de tipos ------------------------------------------------
+    # A contagem acima só enxerga o que JÁ está em PADROES_TIPO — ela é cega
+    # para tipos que existem na API e não são monitorados. Este censo lista
+    # os valores CRUS de 'nomeValorMobiliario', que é o texto contra o qual
+    # os padrões casam. É a partir daqui que se escreve o regex de um tipo
+    # novo, sem chutar a grafia.
+    #
+    # Varre uma janela bem mais larga que a verificação normal: tipo raro
+    # (poucas emissões por ano) simplesmente não aparece nos últimos meses.
+    print("\n" + "=" * 66)
+    print("CENSO DE TIPOS — valores crus de 'nomeValorMobiliario'")
+    print(f"(varredura ampla: até {INSPECT_QTD} ofertas nos últimos "
+          f"{INSPECT_DIAS} dias)")
+    print("=" * 66)
+    try:
+        amplos = sre_listar_ofertas(sess, INSPECT_QTD, dias=INSPECT_DIAS)
+    except Exception as exc:  # noqa: BLE001
+        print(f"⚠️  Varredura ampla falhou ({exc}); usando a amostra normal.")
+        amplos = brutos
+
+    tipos = Counter()
+    for reg in amplos:
+        tipos[str(reg.get("nomeValorMobiliario", "") or "").strip()] += 1
+    print(f"{len(amplos)} ofertas varridas, {len(tipos)} tipos distintos.\n")
+    print(f"   {'qtd':>5}  {'monitorado':^11}  tipo")
+    for tipo, qtd in tipos.most_common():
+        cats = categorias_do_texto(tipo)
+        marca = "sim" if cats else ">> NAO <<"
+        print(f"   {qtd:>5}  {marca:^11}  {tipo!r}")
 
     # exemplo de mensagem (busca detalhes extras de um exemplo de cada tipo)
     print("\nExemplos de mensagem:")
