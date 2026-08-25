@@ -140,8 +140,9 @@ canal.
 
 ## Notas úteis
 
-**Frequência:** o robô roda a cada 30 minutos em dias úteis e a cada 3 horas
-nos fins de semana. Para mudar, edite os `cron` em
+**Frequência:** entre 07h e 24h (BRT), o robô roda a cada 2 minutos em dias
+úteis e a cada 10 minutos nos fins de semana; de madrugada fica parado.
+Para mudar, edite os `cron` em
 `.github/workflows/cvm-robo.yml`. Atenção que o cron do GitHub é em **UTC**
 (Brasil = UTC−3).
 
@@ -150,8 +151,14 @@ no segundo — em horários de pico pode atrasar de 5 a 20 minutos. Não é
 relevante pra este robô.
 
 **Pausa após 60 dias parado:** se o repositório ficar 60 dias sem nenhum
-commit, o GitHub pausa o agendamento automático (manda e-mail avisando).
-Pra reativar, basta ir em Actions e reabilitar, ou fazer um commit qualquer.
+commit, o GitHub **desativa** o agendamento (manda e-mail avisando). Foi o
+que derrubou o robô em 22/08/2026. Agora o workflow se defende sozinho: o
+passo “Manter o agendamento vivo” empurra um commit vazio sempre que o
+repositório passa de 50 dias parado.
+
+Se ainda assim acontecer, a reativação é **manual** — aba **Actions** →
+workflow **Robô CVM → Telegram** → menu `···` → **Enable workflow**. Fazer
+um commit novo não reativa um workflow já desativado.
 
 **Cache do estado:** o GitHub remove caches não acessados por 7 dias. Como
 o robô roda todo dia, o cache é renovado continuamente. Se o robô ficar
