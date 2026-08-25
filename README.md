@@ -14,7 +14,23 @@ Ofertas dos tipos:
 - **Notas Comerciais** (e Notas Promissórias Comerciais)
 - **Outros títulos de securitização** (inclui "Certificados de Recebíveis" sem qualificador)
 - **CPR** — Cédula de Produto Rural (a CVM registra só a modalidade
-  **Financeira**, a CPR-F; é um tipo raro, ~4 emissões por ano)
+  **Financeira**, a CPR-F)
+- **FIAGRO** — cotas de Fundo de Investimento nas Cadeias Agroindustriais
+- **Fundos de Infraestrutura** — cotas de FI-Infra
+- **Ações**
+
+Ficam **de fora de propósito**: cotas de FIDC, FII, FIP, FIF e Funcine.
+Juntas elas são a maior parte das ofertas do SRE (só FIDC e FII passam de
+50% do total) e afogariam o canal. Para incluir alguma, basta acrescentar
+uma entrada em `PADROES_TIPO` — use antes o *censo de tipos* do modo
+`inspecionar` para pegar a grafia exata.
+
+Referência de volume, medida no censo de 25/08/2026 sobre as **2000 ofertas
+mais recentes**: FIDC 776, CRI 262, FII 228, Debêntures 207, Notas
+Comerciais 118, FIP 111, FIF 102, FIAGRO 71, CRA 51, Outros títulos de
+securitização 40, Fundos de Infra 11, CPR 8, Ações 7, Certificados de
+Recebíveis 6, Funcine 2. Com a configuração atual, o robô acompanha 781
+dessas 2000 (~39%).
 
 E acompanha o **ciclo de vida** de cada oferta — pode enviar **dois alertas**:
 

@@ -13,7 +13,8 @@ A mesma oferta pode gerar dois alertas ao longo do ciclo:
 "📥 em análise"  ->  "✅ registrada".
 
 Tipos monitorados: CRA, CRI, Debêntures, Notas Comerciais, Outros títulos
-de securitização e CPR (Cédula de Produto Rural Financeira).
+de securitização, CPR (Cédula de Produto Rural Financeira), FIAGRO,
+Fundos de Infraestrutura e Ações.
 
 Fonte de dados — principal
 --------------------------
@@ -123,6 +124,19 @@ PADROES_TIPO = {
     "CPR — Cédula de Produto Rural": [
         r"\bcpr\b",
         r"\bcedulas?\s+de\s+produto\s+rural",
+    ],
+    # Cotas de fundos e ações. Grafias confirmadas pelo censo de 25/08/2026:
+    # 'Cotas de FIAGRO', 'Cotas de Fundos de Infra' e 'Ações'.
+    # NÃO inclui FIDC/FII/FIP/FIF (juntos, ~60% de todas as ofertas do SRE) —
+    # foram deixados de fora de propósito, para não afogar o canal.
+    "FIAGRO — Fundo de Investimento nas Cadeias Agroindustriais": [
+        r"\bfiagro\b",
+    ],
+    "Fundos de Infraestrutura": [
+        r"\bfundos?\s+de\s+infra",
+    ],
+    "Ações": [
+        r"\bacoes\b",
     ],
 }
 
