@@ -13,6 +13,8 @@ Ofertas dos tipos:
 - **Debêntures**
 - **Notas Comerciais** (e Notas Promissórias Comerciais)
 - **Outros títulos de securitização** (inclui "Certificados de Recebíveis" sem qualificador)
+- **CPR** — Cédula de Produto Rural (a CVM registra só a modalidade
+  **Financeira**, a CPR-F; é um tipo raro, ~4 emissões por ano)
 
 E acompanha o **ciclo de vida** de cada oferta — pode enviar **dois alertas**:
 
@@ -246,6 +248,14 @@ Tudo no bloco **CONFIGURAÇÃO**:
   absorvidas pelo retry e pelo limiar de falhas consecutivas.
 - **Para diagnóstico**, rode o modo `inspecionar`: ele mostra no log se a API
   respondeu, os status encontrados, a contagem por tipo e exemplos de mensagem.
+- **Para descobrir tipos novos**, use o *censo de tipos* que o `inspecionar`
+  imprime no fim: ele varre uma janela larga (padrão 2000 ofertas / 730 dias,
+  ajustável por `INSPECT_QTD` e `INSPECT_DIAS`) e lista os valores crus de
+  `nomeValorMobiliario`, marcando quais já são monitorados. É de onde se tira
+  a grafia exata para escrever um padrão novo em `PADROES_TIPO` — sem chutar.
+  No censo de 25/08/2026, os tipos existentes e **não** monitorados eram:
+  Cotas de FIDC, FII, FIP, FIF, FIAGRO, Fundos de Infra e Funcine, além de
+  Ações.
 
 -----
 

@@ -12,7 +12,8 @@ canal do Telegram quando:
 A mesma oferta pode gerar dois alertas ao longo do ciclo:
 "📥 em análise"  ->  "✅ registrada".
 
-Tipos monitorados: CRA, CRI, Debêntures e Notas Comerciais.
+Tipos monitorados: CRA, CRI, Debêntures, Notas Comerciais, Outros títulos
+de securitização e CPR (Cédula de Produto Rural Financeira).
 
 Fonte de dados — principal
 --------------------------
@@ -112,6 +113,16 @@ PADROES_TIPO = {
     "Outros títulos de securitização": [
         r"outros\s+titulos\s+de\s+securitiza",
         r"^certificad\w*\s+de\s+recebiveis$",
+    ],
+    # CPR — na prática a CVM registra só a modalidade FINANCEIRA (CPR-F);
+    # o censo de tipos de 25/08/2026 (2000 ofertas / 730 dias) mostrou
+    # 'Cédula de Produto Rural Financeira' como a única grafia usada, sem
+    # nenhuma "Cédula de Produto Rural" pura. O padrão abaixo casa as duas
+    # de propósito: se a CVM passar a registrar a modalidade simples, ela
+    # entra sozinha, sem precisar mexer aqui.
+    "CPR — Cédula de Produto Rural": [
+        r"\bcpr\b",
+        r"\bcedulas?\s+de\s+produto\s+rural",
     ],
 }
 
