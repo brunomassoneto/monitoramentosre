@@ -68,6 +68,11 @@ concurrency:
   group: cvm-robo
   cancel-in-progress: false
 
+# O passo de keepalive (no fim do job) precisa empurrar um commit para
+# zerar o contador de inatividade do GitHub. Só 'contents' é liberado.
+permissions:
+  contents: write
+
 jobs:
   verificar-ofertas:
     runs-on: ubuntu-latest
@@ -119,3 +124,48 @@ jobs:
               python cvm_telegram_bot.py
               ;;
           esac
+
+      # -----------------------------------------------------------------
+      # KEEPALIVE — impede o GitHub de desativar o robô por inatividade.
+      #
+      # Em repositório público, o GitHub DESATIVA automaticamente todo
+      # workflow com `schedule:` depois de 60 DIAS SEM ATIVIDADE (ou seja,
+      # sem nenhum commit). Como este robô guarda o estado no cache — de
+      # propósito, pra manter o repositório limpo — ele nunca commita, o
+      # repositório fica parado e o relógio dos 60 dias corre solto.
+      #
+      # Foi exatamente o que aconteceu: último commit em 23/06/2026,
+      # robô desativado em 22/08/2026 — 60 dias cravados. Como o robô
+      # parou de rodar, ele não tinha como avisar que tinha parado.
+      #
+      # Este passo empurra um commit VAZIO quando o último commit passa de
+      # 50 dias (10 dias de folga). Custo: ~1 commit a cada 50 dias, sem
+      # nenhuma mudança de código. Commits feitos com o GITHUB_TOKEN não
+      # disparam novos workflows, então não há risco de laço.
+      #
+      # Se o push falhar, o passo fica vermelho de propósito: é o único
+      # alarme visível de que o agendamento vai cair de novo.
+      # -----------------------------------------------------------------
+      - name: Manter o agendamento vivo (anti-inatividade)
+        if: github.event_name == 'schedule'
+        env:
+          DIAS_LIMITE: 50
+        run: |
+          set -euo pipefail
+
+          segundos_ultimo_commit=$(git log -1 --format=%ct)
+          dias_parado=$(( ( $(date +%s) - segundos_ultimo_commit ) / 86400 ))
+          echo "Último commit no repositório: há $dias_parado dia(s)."
+
+          if [ "$dias_parado" -lt "$DIAS_LIMITE" ]; then
+            echo "Menos de $DIAS_LIMITE dias — agendamento seguro, nada a fazer."
+            exit 0
+          fi
+
+          echo "Passou de $DIAS_LIMITE dias — commitando pra zerar o contador."
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit --allow-empty \
+            -m 'Keepalive: manter o agendamento do robô ativo' \
+            -m 'Commit vazio automático, sem mudança de código. O GitHub desativa workflows agendados após 60 dias sem atividade no repositório; este commit zera esse contador.'
+          git push origin "HEAD:${{ github.ref_name }}"
