@@ -90,12 +90,37 @@ Pela interface do GitHub, sem usar terminal:
 ## Passo 6 — Cadastrar os Secrets
 
 1. No repositório: **Settings → Secrets and variables → Actions**.
-1. Botão **New repository secret**. Crie **dois** secrets:
+1. Botão **New repository secret**. Crie os secrets:
    
-   |Name (exatamente assim)|Secret (valor)                                |
-   |-----------------------|----------------------------------------------|
-   |`TELEGRAM_BOT_TOKEN`   |o token do BotFather (ex.: `123456789:AAE...`)|
-   |`TELEGRAM_CHAT_ID`     |o `chat_id` do canal (ex.: `-1001234567890`)  |
+   |Name (exatamente assim)   |Secret (valor)                                       |Obrigatório|
+   |--------------------------|-----------------------------------------------------|:---------:|
+   |`TELEGRAM_BOT_TOKEN`      |o token do BotFather (ex.: `123456789:AAE...`)       |sim        |
+   |`TELEGRAM_CHAT_ID`        |o `chat_id` do canal (ex.: `-1001234567890`)         |sim        |
+   |`TELEGRAM_ADMIN_CHAT_ID`  |o seu `chat_id` **pessoal** na DM com o bot          |recomendado|
+
+### Por que cadastrar o `TELEGRAM_ADMIN_CHAT_ID`
+
+O robô manda dois tipos de mensagem: **alertas de oferta** (que interessam a
+todo mundo no canal) e **avisos administrativos** de “modo reserva” — diagnóstico
+de que a API da CVM não respondeu, que não é uma oferta de verdade.
+
+Com este secret cadastrado, o aviso administrativo vai para a **sua DM privada**
+com o bot e o canal fica só com alertas de oferta. **Sem ele, o robô cai de volta
+no `TELEGRAM_CHAT_ID` e o aviso técnico aparece no canal, para todos.**
+
+Para descobrir o seu `chat_id` pessoal:
+
+1. Abra uma conversa privada com o seu bot no Telegram e mande `/start`
+   (**esse passo é obrigatório** — o Telegram só deixa um bot escrever para
+   quem falou com ele primeiro).
+1. Abra `https://api.telegram.org/bot<TOKEN>/getUpdates` no navegador.
+1. Procure por **`"message"`** (não `"channel_post"`) — abaixo vem
+   `"chat":{"id":123456789,...}`. Esse número, **positivo e sem o `-100`**, é o
+   seu `chat_id` pessoal.
+
+> O modo `testar-telegram` valida os dois destinos: manda uma mensagem no canal
+> e outra na DM administrativa. Se a do canal chegar e a da DM não, quase sempre
+> é porque faltou o `/start` na conversa privada.
 
 ## Passo 7 — Ativar o workflow (se necessário)
 
