@@ -1153,7 +1153,13 @@ def modo_inspect() -> None:
                 continue
             algum = True
             if o.id:
+                # Mesmo enriquecimento do fluxo real de verificar() --
+                # inclusive os campos do requerimento. Sem eles o exemplo
+                # sai sem vencimento/remuneracao/amortizacao, e o
+                # inspecionar deixa de ser espelho fiel do que o robo
+                # envia (ficando cego a uma quebra de requerimento/{id}).
                 o.coordenadores = sre_coordenadores(sess, o.id, o.lider)
+                o.campos = sre_campos_requerimento(sess, o.id)
                 if o.eh_cri_cra():
                     o.devedor = sre_detalhe_devedor(sess, o.id)
             print("\n" + "- " * 27)
