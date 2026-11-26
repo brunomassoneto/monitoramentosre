@@ -106,7 +106,7 @@ PADROES_TIPO = {
         r"\bdebentur",
     ],
     "Notas Comerciais": [
-        r"\bnotas?\s+comerci", r"\bnota\s+promissoria",
+        r"\bnotas?\s+comerci", r"\bnotas?\s+promissori",
     ],
     # "Outros títulos de securitização" — a própria string da API; também
     # inclui "Certificados de Recebíveis" sem qualificador (securitização
